@@ -1,6 +1,6 @@
 # Divinum Officium for Omarchy
 
-An unofficial [Divinum Officium](https://www.divinumofficium.com/) client for the Omarchy bar. It keeps the traditional Roman canonical hours close at hand while leaving the liturgical texts to the open-source Divinum Officium project.
+An unofficial [Divinum Officium](https://www.divinumofficium.com/) client for traditional Catholic prayer in the Omarchy bar. It keeps the traditional Roman canonical hours close at hand while leaving the liturgical texts to the open-source Divinum Officium project.
 
 ![Divinum Officium plugin preview](preview.png)
 
