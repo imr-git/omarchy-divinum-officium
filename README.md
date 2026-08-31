@@ -26,11 +26,20 @@ Click the gear in the panel's lower-right corner to choose the rubrics, primary 
 omarchy plugin add https://github.com/imr-git/omarchy-divinum-officium.git --enable
 ```
 
-The widget defaults to the center section. To place it on the right:
+The widget appears in the center section by default, so no placement command is required after installation. To move it to a different section later, use one of:
 
 ```bash
+# Left
+omarchy bar move io.github.imr-git.divinum-officium --section left
+
+# Center
+omarchy bar move io.github.imr-git.divinum-officium --section center
+
+# Right
 omarchy bar move io.github.imr-git.divinum-officium --section right
 ```
+
+Add `--index 0` to place it first in that section, or use `--before <widget-id>` / `--after <widget-id>` for precise ordering. The bar updates immediately.
 
 ## Usage
 
