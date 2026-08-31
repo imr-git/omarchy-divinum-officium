@@ -204,18 +204,24 @@ Panel {
     solarProc.running = true
   }
 
+  function openExternal(url) {
+    if (!url) return
+    root.close()
+    Quickshell.execDetached(["omarchy-launch-browser", url])
+  }
+
   function openOffice(hour) {
     if (!hour) return
-    Quickshell.execDetached(["omarchy-launch-browser", Model.officeUrl(root.now, hour.command, root.version, root.primaryLanguage, root.secondaryLanguage)])
+    root.openExternal(Model.officeUrl(root.now, hour.command, root.version, root.primaryLanguage, root.secondaryLanguage))
   }
 
   function openMass() {
-    Quickshell.execDetached(["omarchy-launch-browser", Model.massUrl(root.now, root.version, root.primaryLanguage, root.secondaryLanguage)])
+    root.openExternal(Model.massUrl(root.now, root.version, root.primaryLanguage, root.secondaryLanguage))
   }
 
   function openSaintInfo() {
     if (!root.report || !root.report.title) return
-    Quickshell.execDetached(["omarchy-launch-browser", Model.martyrologyUrl(root.now)])
+    root.openExternal(Model.martyrologyUrl(root.now))
   }
 
   Process {
