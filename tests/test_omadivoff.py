@@ -208,7 +208,8 @@ class MetadataTests(unittest.TestCase):
         self.assertEqual(1, mocked_open.call_count)
         self.assertEqual("2026-08-31T12:02:00+00:00", cooldown["until"])
         self.assertEqual(first["cooldownUntil"], second["cooldownUntil"])
-        self.assertIn("rate-limiting", second["error"])
+        self.assertIn("requests are paused", second["error"])
+        self.assertNotIn("is rate-limiting", second["error"])
 
     def test_429_without_retry_after_defaults_to_one_hour(self):
         now = datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc)

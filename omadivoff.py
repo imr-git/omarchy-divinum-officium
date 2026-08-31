@@ -659,7 +659,7 @@ def fetch_report(
                 primary,
                 secondary,
                 url,
-                f"Divinum Officium is rate-limiting requests; retry after {retry_time}.",
+                f"Divinum Officium requests are paused until {retry_time}.",
                 until,
             )
 
@@ -691,7 +691,7 @@ def fetch_report(
                     primary,
                     secondary,
                     url,
-                    f"Divinum Officium is rate-limiting requests; retry after {retry_time}.",
+                    f"Divinum Officium requests are paused until {retry_time}.",
                     until,
                 )
             return fallback_report(

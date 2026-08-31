@@ -79,7 +79,7 @@ The optional solar schedule places Matins at the eighth hour of night, Lauds at 
 
 The plugin requires Omarchy's Quickshell bar and Python 3; it uses only Python's standard library. Normally once per civil day for the selected rubrics and languages, its metadata helper requests the lightweight calendar heading from `www.divinumofficium.com`. A settings change or explicit manual refresh can request a new heading, but an active rate-limit cooldown is always enforced. The plugin does not prefetch complete Office or Mass pages; those are opened only when clicked.
 
-Successful metadata is retained for today and the previous three days. During an outage, the most recent matching result remains visible. An HTTP 429 response creates a persistent cooldown using the server's `Retry-After` value, or one hour when none is provided, so reopening or restarting the panel cannot repeatedly contact the service.
+Successful metadata is retained for today and the previous three days. During an outage, the most recent matching result remains visible. An HTTP 429 response creates a persistent cooldown using the server's `Retry-After` value, or one hour when none is provided, so reopening or restarting the panel cannot repeatedly contact the service. The panel shows when an active pause ends; once it has ended, the message changes to a manual retry prompt instead of implying that the service is still rate-limiting requests.
 
 Solar events are calculated locally from the coordinates already configured in Omarchy Weather. Those coordinates are not sent to Divinum Officium or another service by this plugin.
 

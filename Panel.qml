@@ -69,6 +69,7 @@ Panel {
     ? currentHour.name + " · " + nextHour.name + " " + Model.remainingLabel(Model.minutesUntilNext(now, currentIndex, hours))
     : "Divine Office"
   readonly property string helperPath: String(Qt.resolvedUrl("omadivoff.py")).replace(/^file:\/\//, "")
+  readonly property string reportStatusText: reportStatusMessage()
 
   function setting(key, fallback) {
     return settings && settings[key] !== undefined ? settings[key] : fallback
@@ -84,6 +85,30 @@ Panel {
     case "white": return "#eeeae0"
     default: return "transparent"
     }
+  }
+
+  function reportStatusMessage() {
+    if (root.reportError === "") return ""
+
+    var rawUntil = root.report && root.report.cooldownUntil
+      ? String(root.report.cooldownUntil)
+      : ""
+    if (rawUntil === "") return root.reportError
+
+    var until = new Date(rawUntil)
+    if (isNaN(until.getTime())) return root.reportError
+
+    var prefix = ""
+    if (root.report && root.report.stale) {
+      var cachedDate = root.report.date ? String(root.report.date) : "an earlier day"
+      prefix = "Using cached metadata from " + cachedDate + ". "
+    }
+
+    if (until.getTime() > root.now.getTime())
+      return prefix + "Divinum Officium requests are paused until "
+        + Qt.formatTime(until, "HH:mm") + "."
+
+    return prefix + "A previous Divinum Officium request was rate-limited. Press R to retry."
   }
 
   function open() {
@@ -549,9 +574,9 @@ Panel {
           }
 
           Text {
-            visible: root.loading || root.reportError !== ""
+            visible: root.loading || root.reportStatusText !== ""
             width: parent.width
-            text: root.loading ? "Loading today’s feast…" : root.reportError
+            text: root.loading ? "Loading today’s feast…" : root.reportStatusText
             textFormat: Text.PlainText
             color: root.dim
             font.family: root.fontFamily
