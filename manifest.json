@@ -1,0 +1,142 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.imr-git.divinum-officium",
+  "name": "Divinum Officium",
+  "version": "0.1.0",
+  "author": "Ivan M. Rodriguez",
+  "license": "MIT",
+  "description": "An unofficial Divinum Officium client for the Omarchy bar, with the traditional Divine Office, Mass, and liturgical calendar.",
+  "tags": [
+    "prayer",
+    "liturgy",
+    "latin",
+    "divine-office",
+    "calendar",
+    "time"
+  ],
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Divine Office",
+    "description": "Current canonical hour, traditional Office, Mass, and liturgical day from Divinum Officium.",
+    "category": "Time",
+    "allowMultiple": false,
+    "defaultSection": "center",
+    "defaults": {
+      "version": "Tridentine - 1570",
+      "primaryLanguage": "Latin",
+      "secondaryLanguage": "English",
+      "showCurrentHourInBar": true,
+      "scheduleMode": "fixed",
+      "matinsTime": "00:00",
+      "laudsTime": "06:00",
+      "primeTime": "07:00",
+      "terceTime": "09:00",
+      "sextTime": "12:00",
+      "noneTime": "15:00",
+      "vespersTime": "18:00",
+      "complineTime": "21:00"
+    },
+    "schema": [
+      {
+        "key": "version",
+        "type": "enum",
+        "label": "Office version",
+        "options": [
+          "Tridentine - 1570",
+          "Tridentine - 1888",
+          "Tridentine - 1906",
+          "Divino Afflatu - 1939",
+          "Divino Afflatu - 1954",
+          "Reduced - 1955",
+          "Rubrics 1960 - 1960",
+          "Rubrics 1960 - 2020 USA"
+        ],
+        "defaultValue": "Tridentine - 1570",
+        "description": "Rubrical edition used for both the Office and Mass."
+      },
+      {
+        "key": "primaryLanguage",
+        "type": "enum",
+        "label": "Primary language",
+        "options": ["Latin", "English", "Deutsch", "French", "Italiano", "Magyar", "Polski", "Portuguese", "Espanol", "Cesky", "Nederlands"],
+        "defaultValue": "Latin"
+      },
+      {
+        "key": "secondaryLanguage",
+        "type": "enum",
+        "label": "Parallel language",
+        "options": ["English", "Latin", "Deutsch", "French", "Italiano", "Magyar", "Polski", "Portuguese", "Espanol", "Cesky", "Nederlands"],
+        "defaultValue": "English"
+      },
+      {
+        "key": "showCurrentHourInBar",
+        "type": "boolean",
+        "label": "Show hour name in bar",
+        "defaultValue": true,
+        "description": "Otherwise the bar displays only the cross mark."
+      },
+      {
+        "key": "scheduleMode",
+        "type": "enum",
+        "label": "Hour schedule",
+        "options": ["fixed", "solar"],
+        "defaultValue": "fixed",
+        "description": "Solar mode follows sunrise and sunset at the location configured in Omarchy Weather."
+      },
+      {
+        "key": "matinsTime",
+        "type": "string",
+        "label": "Matins begins",
+        "defaultValue": "00:00",
+        "description": "Local time in 24-hour HH:MM format."
+      },
+      {
+        "key": "laudsTime",
+        "type": "string",
+        "label": "Lauds begins",
+        "defaultValue": "06:00"
+      },
+      {
+        "key": "primeTime",
+        "type": "string",
+        "label": "Prime begins",
+        "defaultValue": "07:00"
+      },
+      {
+        "key": "terceTime",
+        "type": "string",
+        "label": "Terce begins",
+        "defaultValue": "09:00"
+      },
+      {
+        "key": "sextTime",
+        "type": "string",
+        "label": "Sext begins",
+        "defaultValue": "12:00"
+      },
+      {
+        "key": "noneTime",
+        "type": "string",
+        "label": "None begins",
+        "defaultValue": "15:00"
+      },
+      {
+        "key": "vespersTime",
+        "type": "string",
+        "label": "Vespers begins",
+        "defaultValue": "18:00"
+      },
+      {
+        "key": "complineTime",
+        "type": "string",
+        "label": "Compline begins",
+        "defaultValue": "21:00"
+      }
+    ]
+  }
+}
