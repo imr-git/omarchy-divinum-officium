@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.imr-git.divinum-officium",
   "name": "Divinum Officium",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "author": "Ivan M. Rodriguez",
   "license": "MIT",
   "description": "An unofficial Divinum Officium client for traditional Catholic prayer in the Omarchy bar, with the Divine Office, Mass, and liturgical calendar.",
