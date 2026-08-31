@@ -88,7 +88,6 @@ Panel {
 
   function open() {
     root.controller.show()
-    root.refresh()
     root.refreshSolar()
   }
 
@@ -181,17 +180,19 @@ Panel {
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
 
-  function refresh() {
+  function refresh(force) {
     if (reportProc.running) return
     root.loading = true
     root.reportError = ""
-    reportProc.command = [
+    var command = [
       "python3", root.helperPath, "report",
       "--date", Model.isoDate(root.now),
       "--version", root.version,
       "--primary-language", root.primaryLanguage,
       "--secondary-language", root.secondaryLanguage
     ]
+    if (force === true) command.push("--force")
+    reportProc.command = command
     reportProc.running = true
   }
 
@@ -276,18 +277,7 @@ Panel {
     }
   }
 
-  Timer {
-    interval: 6 * 60 * 60 * 1000
-    running: true
-    repeat: true
-    onTriggered: {
-      root.refresh()
-      root.refreshSolar()
-    }
-  }
-
   Component.onCompleted: {
-    refresh()
     refreshSolar()
   }
 
@@ -307,7 +297,7 @@ Panel {
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(text) {
-        if (!root.settingsOpen && (text === "r" || text === "R")) root.refresh()
+        if (!root.settingsOpen && (text === "r" || text === "R")) root.refresh(true)
       }
 
       Flickable {

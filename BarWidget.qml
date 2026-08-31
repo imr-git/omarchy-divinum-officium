@@ -26,7 +26,7 @@ BarWidget {
   function open() { if (panelLoader.item) panelLoader.item.open() }
   function close() { if (panelLoader.item) panelLoader.item.close() }
   function toggle() { if (panelLoader.item) panelLoader.item.toggle() }
-  function refresh() { if (panelLoader.item) panelLoader.item.refresh() }
+  function refresh(force) { if (panelLoader.item) panelLoader.item.refresh(force === true) }
   function closeForPopoutSwitch() { if (panelLoader.item) panelLoader.item.closeForPopoutSwitch() }
 
   implicitWidth: button.implicitWidth
@@ -35,7 +35,7 @@ BarWidget {
   onBarChanged: injectPanel()
   onSettingsChanged: {
     injectPanel()
-    refresh()
+    refresh(false)
   }
 
   Loader {
@@ -45,6 +45,7 @@ BarWidget {
     visible: false
     onLoaded: {
       root.injectPanel()
+      root.refresh(false)
       Qt.callLater(root.injectPanel)
     }
   }
@@ -59,7 +60,7 @@ BarWidget {
     tooltipText: panelLoader.item ? panelLoader.item.tooltipText : "Divine Office"
 
     onPressed: function(buttonCode) {
-      if (buttonCode === Qt.MiddleButton) root.refresh()
+      if (buttonCode === Qt.MiddleButton) root.refresh(true)
       else root.toggle()
     }
 

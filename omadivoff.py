@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+from email.utils import parsedate_to_datetime
+import fcntl
 import hashlib
 import html
 import json
@@ -12,7 +15,6 @@ import os
 import re
 import sys
 import tempfile
-import time
 from datetime import date, datetime, timedelta
 from html.parser import HTMLParser
 from pathlib import Path
@@ -23,8 +25,9 @@ from urllib.request import Request, urlopen
 
 
 OFFICE_ENDPOINT = "https://www.divinumofficium.com/cgi-bin/horas/officium.pl"
-CACHE_MAX_AGE_SECONDS = 6 * 60 * 60
-CACHE_SCHEMA_VERSION = "4"
+CACHE_SCHEMA_VERSION = "5"
+CACHE_RETENTION_DAYS = 3
+DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 60 * 60
 HEADING_COLOR_MAP = {
     "black": "black",
     "blue": "white",
@@ -234,6 +237,31 @@ def cache_path(day: date, version: str, primary: str, secondary: str) -> Path:
     return cache_dir() / f"report-{digest}.json"
 
 
+def cooldown_path() -> Path:
+    return cache_dir() / "rate-limit.json"
+
+
+def request_lock_path() -> Path:
+    return cache_dir() / "request.lock"
+
+
+def current_time() -> datetime:
+    return datetime.now().astimezone()
+
+
+@contextmanager
+def request_lock():
+    """Serialize metadata requests across helper processes."""
+    path = request_lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def site_date(day: date) -> str:
     return day.strftime("%m-%d-%Y")
 
@@ -325,10 +353,12 @@ def liturgical_color(title: str) -> str:
     return "white"
 
 
-def office_url(day: date, version: str, primary: str, secondary: str) -> str:
+def calendar_url(day: date, version: str, primary: str, secondary: str) -> str:
     return OFFICE_ENDPOINT + "?" + urlencode(
         {
-            "command": "prayLaudes",
+            # This returns only the calendar heading after precedence has
+            # been calculated, instead of rendering an entire canonical hour.
+            "command": "kalendar",
             "date1": site_date(day),
             "version": version,
             "lang1": primary,
@@ -451,18 +481,16 @@ def parse_metadata(document: str, day: date, source_url: str) -> dict[str, objec
         "color": heading_color or liturgical_color(title),
         "commemorations": find_commemorations(lines),
         "sourceUrl": source_url,
-        "fetchedAt": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "fetchedAt": current_time().isoformat(timespec="seconds"),
         "stale": False,
         "error": "",
     }
 
 
-def read_cache(path: Path, allow_stale: bool = False) -> dict[str, object] | None:
+def read_cache(path: Path) -> dict[str, object] | None:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-        age = time.time() - path.stat().st_mtime
-        if allow_stale or age <= CACHE_MAX_AGE_SECONDS:
-            payload["stale"] = age > CACHE_MAX_AGE_SECONDS
+        if isinstance(payload, dict) and not payload.get("error"):
             return payload
     except (OSError, ValueError, TypeError):
         pass
@@ -477,45 +505,222 @@ def write_cache(path: Path, payload: dict[str, object]) -> None:
     temporary.replace(path)
 
 
-def fetch_report(day: date, version: str, primary: str, secondary: str, timeout: float) -> dict[str, object]:
-    path = cache_path(day, version, primary, secondary)
-    cached = read_cache(path)
-    if cached:
-        return cached
+def prune_cache(reference_day: date) -> None:
+    """Keep today and the previous three civil days of successful metadata."""
+    cutoff = reference_day - timedelta(days=CACHE_RETENTION_DAYS)
+    for path in cache_dir().glob("report-*.json"):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            cached_day = date.fromisoformat(str(payload["date"]))
+            if cached_day < cutoff:
+                path.unlink()
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+            continue
 
-    url = office_url(day, version, primary, secondary)
-    # The public CGI currently rejects bot-style user agents with HTTP 403,
-    # while serving the same request to normal desktop browsers.
-    request = Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml",
+
+def latest_cached_report(
+    day: date, version: str, primary: str, secondary: str
+) -> dict[str, object] | None:
+    for days_ago in range(CACHE_RETENTION_DAYS + 1):
+        cached = read_cache(cache_path(day - timedelta(days=days_ago), version, primary, secondary))
+        if cached:
+            return cached
+    return None
+
+
+def read_cooldown(now: datetime | None = None) -> tuple[dict[str, object], datetime] | None:
+    try:
+        payload = json.loads(cooldown_path().read_text(encoding="utf-8"))
+        until = datetime.fromisoformat(str(payload["until"]))
+        current = now or current_time()
+        if until.tzinfo is None:
+            until = until.replace(tzinfo=current.tzinfo)
+        if until > current:
+            return payload, until
+        cooldown_path().unlink(missing_ok=True)
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        pass
+    return None
+
+
+def write_cooldown(until: datetime) -> None:
+    write_cache(
+        cooldown_path(),
+        {
+            "until": until.isoformat(timespec="seconds"),
+            "reason": "Divinum Officium rate limit",
         },
     )
+
+
+def clear_cooldown() -> None:
     try:
-        with urlopen(request, timeout=timeout) as response:
-            document = response.read().decode(response.headers.get_content_charset() or "utf-8", errors="replace")
-        payload = parse_metadata(document, day, url)
-        write_cache(path, payload)
-        return payload
-    except (HTTPError, URLError, TimeoutError, OSError) as error:
-        stale = read_cache(path, allow_stale=True)
-        if stale:
-            stale["error"] = f"Using cached metadata: {error}"
-            return stale
-        return {
+        cooldown_path().unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def retry_after_seconds(error: HTTPError, now: datetime | None = None) -> int:
+    value = error.headers.get("Retry-After") if error.headers else None
+    if value:
+        try:
+            seconds = int(value)
+            if seconds > 0:
+                return seconds
+        except (TypeError, ValueError):
+            try:
+                retry_at = parsedate_to_datetime(value)
+                current = now or current_time()
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=current.tzinfo)
+                seconds = int((retry_at - current).total_seconds())
+                if seconds > 0:
+                    return seconds
+            except (TypeError, ValueError, OverflowError):
+                pass
+    return DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
+
+
+def fallback_report(
+    day: date,
+    version: str,
+    primary: str,
+    secondary: str,
+    source_url: str,
+    message: str,
+    cooldown_until: datetime | None = None,
+) -> dict[str, object]:
+    stale = latest_cached_report(day, version, primary, secondary)
+    if stale:
+        payload = dict(stale)
+        payload["stale"] = True
+        payload["requestedDate"] = day.isoformat()
+        cached_day = str(payload.get("date") or "an earlier day")
+        payload["error"] = f"Using cached metadata from {cached_day}. {message}"
+    else:
+        payload = {
             "date": day.isoformat(),
             "title": day.strftime("%A, %d %B %Y"),
             "rank": "",
-            "season": "",
+            "season": liturgical_season(day),
             "color": "",
             "commemorations": [],
-            "sourceUrl": url,
+            "sourceUrl": source_url,
             "fetchedAt": "",
             "stale": False,
-            "error": f"Daily feast metadata unavailable: {error}",
+            "error": message,
         }
+    if cooldown_until:
+        payload["cooldownUntil"] = cooldown_until.isoformat(timespec="seconds")
+    return payload
+
+
+def cache_mtime(path: Path) -> int | None:
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return None
+
+
+def fetch_report(
+    day: date,
+    version: str,
+    primary: str,
+    secondary: str,
+    timeout: float,
+    force: bool = False,
+) -> dict[str, object]:
+    path = cache_path(day, version, primary, secondary)
+    initial_mtime = cache_mtime(path)
+    if not force:
+        cached = read_cache(path)
+        if cached:
+            return cached
+
+    with request_lock():
+        cached = read_cache(path)
+        current_mtime = cache_mtime(path)
+        if not force and cached:
+            return cached
+        # A concurrent forced or initial request populated this cache while
+        # this process waited for the lock, so do not make the same request.
+        if cached and current_mtime != initial_mtime:
+            return cached
+
+        url = calendar_url(day, version, primary, secondary)
+        now = current_time()
+        cooldown = read_cooldown(now)
+        if cooldown:
+            _, until = cooldown
+            retry_time = until.astimezone().strftime("%H:%M")
+            return fallback_report(
+                day,
+                version,
+                primary,
+                secondary,
+                url,
+                f"Divinum Officium is rate-limiting requests; retry after {retry_time}.",
+                until,
+            )
+
+        # The public CGI currently rejects bot-style user agents with HTTP
+        # 403, while serving the same request to normal desktop browsers.
+        request = Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml",
+            },
+        )
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                document = response.read().decode(
+                    response.headers.get_content_charset() or "utf-8", errors="replace"
+                )
+        except HTTPError as error:
+            if error.code == 429:
+                until = now + timedelta(seconds=retry_after_seconds(error, now))
+                try:
+                    write_cooldown(until)
+                except OSError:
+                    pass
+                retry_time = until.astimezone().strftime("%H:%M")
+                return fallback_report(
+                    day,
+                    version,
+                    primary,
+                    secondary,
+                    url,
+                    f"Divinum Officium is rate-limiting requests; retry after {retry_time}.",
+                    until,
+                )
+            return fallback_report(
+                day,
+                version,
+                primary,
+                secondary,
+                url,
+                f"Daily feast metadata unavailable: {error}",
+            )
+        except (URLError, TimeoutError, OSError) as error:
+            return fallback_report(
+                day,
+                version,
+                primary,
+                secondary,
+                url,
+                f"Daily feast metadata unavailable: {error}",
+            )
+
+        payload = parse_metadata(document, day, url)
+        try:
+            write_cache(path, payload)
+            clear_cooldown()
+            prune_cache(day)
+        except OSError:
+            # A read-only or full cache should not hide otherwise valid data.
+            pass
+        return payload
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -527,6 +732,11 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument("--primary-language", default="Latin")
     report.add_argument("--secondary-language", default="English")
     report.add_argument("--timeout", type=float, default=8.0)
+    report.add_argument(
+        "--force",
+        action="store_true",
+        help="Bypass the daily success cache; an active cooldown is still enforced",
+    )
     solar = subparsers.add_parser("solar", help="Print a local solar canonical-hour schedule as JSON")
     solar.add_argument("--date", default=date.today().isoformat(), help="Civil date in YYYY-MM-DD form")
     solar.add_argument("--weather-state", type=Path, default=None, help="Override Omarchy's Weather state file")
@@ -548,6 +758,7 @@ def main(argv: list[str] | None = None) -> int:
             args.primary_language,
             args.secondary_language,
             max(0.1, args.timeout),
+            force=args.force,
         )
         print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
         return 0

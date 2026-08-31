@@ -1,9 +1,14 @@
+from concurrent.futures import ThreadPoolExecutor
+from email.message import Message
 import importlib.util
 import json
 import tempfile
+import threading
+import time
 import unittest
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from urllib.error import HTTPError
 from unittest.mock import patch
 
 
@@ -14,12 +19,37 @@ omadivoff = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(omadivoff)
 
 
+class FakeResponse:
+    def __init__(self, document: str):
+        self.document = document.encode("utf-8")
+        self.headers = Message()
+        self.headers["Content-Type"] = "text/html; charset=utf-8"
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return False
+
+    def read(self):
+        return self.document
+
+
+CALENDAR_DOCUMENT = """
+<html><body>
+  <P ALIGN=CENTER><FONT COLOR="red">In Decollatione S. Joannis Baptistæ ~ Duplex majus</FONT><br/>
+  <I><SPAN><SPAN>Commemoratio:</SPAN> <FONT COLOR="red">S. Sabinæ Martyris</FONT></SPAN></I></P>
+</body></html>
+"""
+
+
 class MetadataTests(unittest.TestCase):
-    def test_office_url_contains_selected_parameters(self):
-        result = omadivoff.office_url(
+    def test_calendar_url_requests_only_the_lightweight_heading(self):
+        result = omadivoff.calendar_url(
             date(2026, 8, 29), "Tridentine - 1570", "Latin", "English"
         )
-        self.assertIn("command=prayLaudes", result)
+        self.assertIn("command=kalendar", result)
+        self.assertNotIn("prayLaudes", result)
         self.assertIn("date1=08-29-2026", result)
         self.assertIn("version=Tridentine+-+1570", result)
         self.assertIn("lang1=Latin", result)
@@ -94,6 +124,215 @@ class MetadataTests(unittest.TestCase):
             payload = {"title": "Test feast", "stale": False}
             omadivoff.write_cache(path, payload)
             self.assertEqual(payload, omadivoff.read_cache(path))
+
+    def test_successful_report_is_requested_only_once_per_civil_day(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(omadivoff, "cache_dir", return_value=Path(directory)):
+                with patch.object(
+                    omadivoff, "urlopen", return_value=FakeResponse(CALENDAR_DOCUMENT)
+                ) as mocked_open:
+                    first = omadivoff.fetch_report(
+                        date(2026, 8, 29), "Tridentine - 1570", "Latin", "English", 0.1
+                    )
+                    second = omadivoff.fetch_report(
+                        date(2026, 8, 29), "Tridentine - 1570", "Latin", "English", 0.1
+                    )
+                    third = omadivoff.fetch_report(
+                        date(2026, 8, 30), "Tridentine - 1570", "Latin", "English", 0.1
+                    )
+
+        self.assertEqual(first["title"], second["title"])
+        self.assertEqual("2026-08-30", third["date"])
+        self.assertEqual(2, mocked_open.call_count)
+
+    def test_report_uses_previous_success_during_an_outage(self):
+        current_day = date(2026, 8, 30)
+        previous_day = current_day - timedelta(days=1)
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(omadivoff, "cache_dir", return_value=Path(directory)):
+                omadivoff.write_cache(
+                    omadivoff.cache_path(
+                        previous_day, "Tridentine - 1570", "Latin", "English"
+                    ),
+                    {
+                        "date": previous_day.isoformat(),
+                        "title": "Cached feast",
+                        "rank": "Duplex",
+                        "error": "",
+                        "stale": False,
+                    },
+                )
+                with patch.object(omadivoff, "urlopen", side_effect=OSError("offline")):
+                    report = omadivoff.fetch_report(
+                        current_day, "Tridentine - 1570", "Latin", "English", 0.1
+                    )
+
+        self.assertEqual("Cached feast", report["title"])
+        self.assertEqual(previous_day.isoformat(), report["date"])
+        self.assertEqual(current_day.isoformat(), report["requestedDate"])
+        self.assertTrue(report["stale"])
+        self.assertIn("Using cached metadata", report["error"])
+
+    def test_429_persists_retry_after_cooldown_and_blocks_manual_refresh(self):
+        now = datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc)
+        error = HTTPError(
+            "https://example.test",
+            429,
+            "Too Many Requests",
+            {"Retry-After": "120"},
+            None,
+        )
+        self.addCleanup(error.close)
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(omadivoff, "cache_dir", return_value=Path(directory)):
+                with patch.object(omadivoff, "current_time", return_value=now):
+                    with patch.object(omadivoff, "urlopen", side_effect=error) as mocked_open:
+                        first = omadivoff.fetch_report(
+                            date(2026, 8, 31),
+                            "Tridentine - 1570",
+                            "Latin",
+                            "English",
+                            0.1,
+                        )
+                        second = omadivoff.fetch_report(
+                            date(2026, 8, 31),
+                            "Tridentine - 1570",
+                            "Latin",
+                            "English",
+                            0.1,
+                            force=True,
+                        )
+
+                cooldown = json.loads((Path(directory) / "rate-limit.json").read_text())
+
+        self.assertEqual(1, mocked_open.call_count)
+        self.assertEqual("2026-08-31T12:02:00+00:00", cooldown["until"])
+        self.assertEqual(first["cooldownUntil"], second["cooldownUntil"])
+        self.assertIn("rate-limiting", second["error"])
+
+    def test_429_without_retry_after_defaults_to_one_hour(self):
+        now = datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc)
+        error = HTTPError("https://example.test", 429, "Too Many Requests", {}, None)
+        self.addCleanup(error.close)
+        self.assertEqual(
+            60 * 60,
+            omadivoff.retry_after_seconds(error, now),
+        )
+
+    def test_retry_after_accepts_an_http_date(self):
+        now = datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc)
+        error = HTTPError(
+            "https://example.test",
+            429,
+            "Too Many Requests",
+            {"Retry-After": "Mon, 31 Aug 2026 12:05:00 GMT"},
+            None,
+        )
+        self.addCleanup(error.close)
+        self.assertEqual(5 * 60, omadivoff.retry_after_seconds(error, now))
+
+    def test_manual_refresh_succeeds_after_cooldown_expires(self):
+        clock = [datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc)]
+        error = HTTPError("https://example.test", 429, "Too Many Requests", {}, None)
+        self.addCleanup(error.close)
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(omadivoff, "cache_dir", return_value=Path(directory)):
+                with patch.object(omadivoff, "current_time", side_effect=lambda: clock[0]):
+                    with patch.object(
+                        omadivoff,
+                        "urlopen",
+                        side_effect=[error, FakeResponse(CALENDAR_DOCUMENT)],
+                    ) as mocked_open:
+                        omadivoff.fetch_report(
+                            date(2026, 8, 31),
+                            "Tridentine - 1570",
+                            "Latin",
+                            "English",
+                            0.1,
+                        )
+                        clock[0] += timedelta(hours=1, seconds=1)
+                        report = omadivoff.fetch_report(
+                            date(2026, 8, 31),
+                            "Tridentine - 1570",
+                            "Latin",
+                            "English",
+                            0.1,
+                            force=True,
+                        )
+
+        self.assertEqual(2, mocked_open.call_count)
+        self.assertEqual("In Decollatione S. Joannis Baptistæ", report["title"])
+        self.assertEqual("", report["error"])
+
+    def test_cache_pruning_retains_only_today_and_previous_three_days(self):
+        current_day = date(2026, 8, 31)
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(omadivoff, "cache_dir", return_value=Path(directory)):
+                retained = omadivoff.cache_path(
+                    current_day - timedelta(days=3),
+                    "Tridentine - 1570",
+                    "Latin",
+                    "English",
+                )
+                expired = omadivoff.cache_path(
+                    current_day - timedelta(days=4),
+                    "Tridentine - 1570",
+                    "Latin",
+                    "English",
+                )
+                for path, cached_day in (
+                    (retained, current_day - timedelta(days=3)),
+                    (expired, current_day - timedelta(days=4)),
+                ):
+                    omadivoff.write_cache(
+                        path,
+                        {
+                            "date": cached_day.isoformat(),
+                            "title": "Cached feast",
+                            "error": "",
+                        },
+                    )
+                omadivoff.prune_cache(current_day)
+
+                self.assertTrue(retained.exists())
+                self.assertFalse(expired.exists())
+
+    def test_simultaneous_requests_are_deduplicated(self):
+        entered_request = threading.Event()
+        release_request = threading.Event()
+
+        def slow_response(*args, **kwargs):
+            entered_request.set()
+            release_request.wait(timeout=2)
+            return FakeResponse(CALENDAR_DOCUMENT)
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(omadivoff, "cache_dir", return_value=Path(directory)):
+                with patch.object(omadivoff, "urlopen", side_effect=slow_response) as mocked_open:
+                    with ThreadPoolExecutor(max_workers=2) as executor:
+                        first = executor.submit(
+                            omadivoff.fetch_report,
+                            date(2026, 8, 31),
+                            "Tridentine - 1570",
+                            "Latin",
+                            "English",
+                            0.1,
+                        )
+                        self.assertTrue(entered_request.wait(timeout=1))
+                        second = executor.submit(
+                            omadivoff.fetch_report,
+                            date(2026, 8, 31),
+                            "Tridentine - 1570",
+                            "Latin",
+                            "English",
+                            0.1,
+                        )
+                        time.sleep(0.05)
+                        release_request.set()
+                        reports = (first.result(timeout=2), second.result(timeout=2))
+
+        self.assertEqual(1, mocked_open.call_count)
+        self.assertEqual(reports[0]["title"], reports[1]["title"])
 
     def test_report_falls_back_cleanly_when_offline(self):
         with tempfile.TemporaryDirectory() as directory:

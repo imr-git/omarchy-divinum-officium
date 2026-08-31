@@ -12,7 +12,7 @@ An unofficial [Divinum Officium](https://www.divinumofficium.com/) client for tr
 - The day's feast or Sunday, rank, liturgical season and color, and commemorations.
 - A feast-title link to the corresponding date in CatholicSaints.Info's public 1914 Roman Martyrology.
 - Fixed custom hour boundaries or a sunrise-and-sunset schedule based on the location configured in Omarchy Weather.
-- Six-hour metadata caching, with the most recent result retained for offline use.
+- One lightweight metadata request per day, with a three-day cache, stale-data fallback, and rate-limit cooldowns.
 
 ### Settings
 
@@ -41,10 +41,26 @@ omarchy bar move io.github.imr-git.divinum-officium --section right
 
 Add `--index 0` to place it first in that section, or use `--before <widget-id>` / `--after <widget-id>` for precise ordering. The bar updates immediately.
 
+## Update
+
+Git-managed installations can be updated with:
+
+```bash
+omarchy plugin update io.github.imr-git.divinum-officium
+```
+
+Omarchy shows the incoming diff, fast-forwards the installed checkout, validates the updated manifest, and rescans the shell. If an affected Omarchy release continues showing the previous QML after the update, restart the shell once:
+
+```bash
+omarchy restart shell
+```
+
+No cache cleanup is required when updating. The plugin starts a new cache schema when necessary and removes expired metadata during its next successful daily refresh.
+
 ## Usage
 
 - Click the cross to open or close the panel.
-- Middle-click the cross, or press `R` while the panel is focused, to refresh the liturgical metadata.
+- Middle-click the cross, or press `R` while the panel is focused, to refresh the liturgical metadata after any active cooldown.
 - Click an hour or **Mass of the Day** to open it on Divinum Officium.
 - Click the feast title to open that date in the Roman Martyrology.
 - Click the gear to edit settings; press `Escape` to close settings or the panel.
@@ -61,11 +77,13 @@ The optional solar schedule places Matins at the eighth hour of night, Lauds at 
 
 ## Dependencies and network access
 
-The plugin requires Omarchy's Quickshell bar and Python 3; it uses only Python's standard library. Daily metadata requests send the selected civil date, rubrical version, and languages to `www.divinumofficium.com`. Clicking an Office or Mass opens Divinum Officium in the configured browser.
+The plugin requires Omarchy's Quickshell bar and Python 3; it uses only Python's standard library. Normally once per civil day for the selected rubrics and languages, its metadata helper requests the lightweight calendar heading from `www.divinumofficium.com`. A settings change or explicit manual refresh can request a new heading, but an active rate-limit cooldown is always enforced. The plugin does not prefetch complete Office or Mass pages; those are opened only when clicked.
+
+Successful metadata is retained for today and the previous three days. During an outage, the most recent matching result remains visible. An HTTP 429 response creates a persistent cooldown using the server's `Retry-After` value, or one hour when none is provided, so reopening or restarting the panel cannot repeatedly contact the service.
 
 Solar events are calculated locally from the coordinates already configured in Omarchy Weather. Those coordinates are not sent to Divinum Officium or another service by this plugin.
 
-Results are cached under `${XDG_CACHE_HOME:-~/.cache}/omadivoff`.
+Results and rate-limit state are cached under `${XDG_CACHE_HOME:-~/.cache}/omadivoff`.
 
 ## Remove
 
