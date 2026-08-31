@@ -41,6 +41,22 @@ omarchy bar move io.github.imr-git.divinum-officium --section right
 
 Add `--index 0` to place it first in that section, or use `--before <widget-id>` / `--after <widget-id>` for precise ordering. The bar updates immediately.
 
+## Update
+
+Git-managed installations can be updated with:
+
+```bash
+omarchy plugin update io.github.imr-git.divinum-officium
+```
+
+Omarchy shows the incoming diff, fast-forwards the installed checkout, validates the updated manifest, and rescans the shell. If an affected Omarchy release continues showing the previous QML after the update, restart the shell once:
+
+```bash
+omarchy restart shell
+```
+
+No cache cleanup is required when updating. The plugin starts a new cache schema when necessary and removes expired metadata during its next successful daily refresh.
+
 ## Usage
 
 - Click the cross to open or close the panel.
