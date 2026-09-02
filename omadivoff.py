@@ -13,21 +13,32 @@ import json
 import math
 import os
 import re
+import secrets
+import stat
 import sys
-import tempfile
+import time
 from datetime import date, datetime, timedelta
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, TextIO
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from urllib.parse import urlencode, urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
 OFFICE_ENDPOINT = "https://www.divinumofficium.com/cgi-bin/horas/officium.pl"
-CACHE_SCHEMA_VERSION = "5"
+CACHE_SCHEMA_VERSION = "6"
 CACHE_RETENTION_DAYS = 3
+MAX_CACHE_DIRECTORY_ENTRIES = 256
 MAX_RESPONSE_BYTES = 256 * 1024
+MAX_CACHE_FILE_BYTES = 64 * 1024
+MAX_WEATHER_STATE_BYTES = 16 * 1024
+MAX_WEATHER_NAME_CHARS = 96
+MAX_WEATHER_NAME_BYTES = 256
+MAX_HELPER_OUTPUT_BYTES = 64 * 1024
+MAX_HELPER_STDERR_BYTES = 8 * 1024
+LOCK_WAIT_SECONDS = 10
+MAX_RATE_LIMIT_COOLDOWN_SECONDS = 24 * 60 * 60
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 60 * 60
 DEFAULT_ACCESS_DENIED_COOLDOWN_SECONDS = 6 * 60 * 60
 REQUEST_USER_AGENT = (
@@ -54,6 +65,29 @@ RANK_WORDS = (
     "vigilia",
     "infra octavam",
 )
+OFFICE_VERSIONS = (
+    "Tridentine - 1570",
+    "Tridentine - 1888",
+    "Tridentine - 1906",
+    "Divino Afflatu - 1939",
+    "Divino Afflatu - 1954",
+    "Reduced - 1955",
+    "Rubrics 1960 - 1960",
+    "Rubrics 1960 - 2020 USA",
+)
+OFFICE_LANGUAGES = (
+    "Latin",
+    "English",
+    "Deutsch",
+    "French",
+    "Italiano",
+    "Magyar",
+    "Polski",
+    "Portuguese",
+    "Espanol",
+    "Cesky",
+    "Nederlands",
+)
 
 
 class ResponseTooLargeError(RuntimeError):
@@ -64,6 +98,122 @@ class MetadataParseError(RuntimeError):
     """Raised when an upstream response is not recognizable calendar metadata."""
 
 
+class LocalDataSecurityError(OSError):
+    """Raised when a local producer does not satisfy the safe-file contract."""
+
+
+class HelperDeadlineError(TimeoutError):
+    """Raised when the helper exceeds its total execution deadline."""
+
+
+class SameOriginRedirectHandler(HTTPRedirectHandler):
+    """Allow only HTTPS redirects that remain on Divinum Officium."""
+
+    def redirect_request(self, request, file_pointer, code, message, headers, new_url):
+        try:
+            destination = urlsplit(new_url)
+            allowed = (
+                destination.scheme == "https"
+                and destination.hostname == "www.divinumofficium.com"
+                and destination.port in {None, 443}
+            )
+        except ValueError:
+            allowed = False
+        if not allowed:
+            raise URLError("Refused a cross-origin metadata redirect.")
+        return super().redirect_request(
+            request,
+            file_pointer,
+            code,
+            message,
+            headers,
+            new_url,
+        )
+
+
+OFFICE_OPENER = build_opener(SameOriginRedirectHandler())
+
+
+class BoundedTextStream:
+    """Forward at most a fixed number of encoded bytes to a text stream."""
+
+    def __init__(self, wrapped: TextIO, limit: int) -> None:
+        self.wrapped = wrapped
+        self.remaining = limit
+        self.encoding = getattr(wrapped, "encoding", None) or "utf-8"
+
+    def write(self, value: str) -> int:
+        text = str(value)
+        if self.remaining <= 0:
+            return len(text)
+        encoded = text.encode(self.encoding, errors="replace")
+        chunk = encoded[: self.remaining]
+        self.remaining -= len(chunk)
+        buffer = getattr(self.wrapped, "buffer", None)
+        if buffer is not None:
+            buffer.write(chunk)
+        else:
+            self.wrapped.write(chunk.decode(self.encoding, errors="ignore"))
+        return len(text)
+
+    def flush(self) -> None:
+        self.wrapped.flush()
+
+    def fileno(self) -> int:
+        return self.wrapped.fileno()
+
+    def isatty(self) -> bool:
+        return self.wrapped.isatty()
+
+
+def _validate_owned_regular_file(
+    descriptor: int,
+    *,
+    require_private: bool,
+) -> os.stat_result:
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISREG(metadata.st_mode):
+        raise LocalDataSecurityError("Local state is not a regular file.")
+    if metadata.st_uid != os.geteuid():
+        raise LocalDataSecurityError("Local state is not owned by the current user.")
+    if metadata.st_nlink != 1:
+        raise LocalDataSecurityError("Local state must have exactly one hard link.")
+    if require_private and stat.S_IMODE(metadata.st_mode) & 0o077:
+        raise LocalDataSecurityError("Local state permissions are not private.")
+    return metadata
+
+
+def _read_bounded_descriptor(descriptor: int, limit: int) -> bytes:
+    metadata = os.fstat(descriptor)
+    if metadata.st_size > limit:
+        raise LocalDataSecurityError(f"Local state exceeds the {limit}-byte limit.")
+    chunks: list[bytes] = []
+    remaining = limit + 1
+    while remaining > 0:
+        chunk = os.read(descriptor, min(16 * 1024, remaining))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    content = b"".join(chunks)
+    if len(content) > limit:
+        raise LocalDataSecurityError(f"Local state exceeds the {limit}-byte limit.")
+    _validate_owned_regular_file(descriptor, require_private=False)
+    return content
+
+
+def read_owned_json_file(path: Path, limit: int) -> object:
+    """Read a bounded, owned, regular, single-link JSON file without following it."""
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        _validate_owned_regular_file(descriptor, require_private=False)
+        content = _read_bounded_descriptor(descriptor, limit)
+    finally:
+        os.close(descriptor)
+    return json.loads(content.decode("utf-8"))
+
+
 def weather_state_path() -> Path:
     """Return the location state owned by Omarchy's Weather panel."""
     return Path.home() / ".local/state/omarchy/settings/weather.json"
@@ -71,17 +221,59 @@ def weather_state_path() -> Path:
 
 def load_weather_location(path: Path | None = None) -> dict[str, object] | None:
     try:
-        payload = json.loads((path or weather_state_path()).read_text(encoding="utf-8"))
-        latitude = float(payload["latitude"])
-        longitude = float(payload["longitude"])
-        if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
+        payload = read_owned_json_file(
+            path or weather_state_path(),
+            MAX_WEATHER_STATE_BYTES,
+        )
+        if not isinstance(payload, dict):
+            return None
+        latitude_value = payload.get("latitude")
+        longitude_value = payload.get("longitude")
+        if (
+            isinstance(latitude_value, bool)
+            or not isinstance(latitude_value, (int, float))
+            or isinstance(longitude_value, bool)
+            or not isinstance(longitude_value, (int, float))
+        ):
+            return None
+        latitude = float(latitude_value)
+        longitude = float(longitude_value)
+        if (
+            not math.isfinite(latitude)
+            or not math.isfinite(longitude)
+            or not (-90 <= latitude <= 90 and -180 <= longitude <= 180)
+        ):
+            return None
+        raw_name = payload.get("name")
+        if raw_name is None or raw_name == "":
+            name = "Local weather location"
+        elif not isinstance(raw_name, str):
+            return None
+        else:
+            name = re.sub(r"\s+", " ", raw_name).strip()
+            if (
+                not name
+                or not name.isprintable()
+                or len(name) > MAX_WEATHER_NAME_CHARS
+                or len(name.encode("utf-8")) > MAX_WEATHER_NAME_BYTES
+            ):
+                return None
+        if not name:
             return None
         return {
-            "name": str(payload.get("name") or "Local weather location"),
+            "name": name,
             "latitude": latitude,
             "longitude": longitude,
         }
-    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+    except (
+        OSError,
+        UnicodeError,
+        ValueError,
+        TypeError,
+        KeyError,
+        RecursionError,
+        json.JSONDecodeError,
+    ):
         return None
 
 
@@ -261,21 +453,159 @@ def request_lock_path() -> Path:
     return cache_dir() / "request.lock"
 
 
+def _cache_leaf(path: Path) -> str:
+    configured_directory = os.path.abspath(os.fspath(cache_dir()))
+    requested_directory = os.path.abspath(os.fspath(path.parent))
+    if requested_directory != configured_directory:
+        raise LocalDataSecurityError("Cache path escaped the configured cache directory.")
+    name = path.name
+    if not re.fullmatch(
+        r"(?:report-[0-9a-f]{16}\.json|rate-limit\.json|request\.lock)",
+        name,
+    ):
+        raise LocalDataSecurityError("Cache filename is not recognized.")
+    return name
+
+
+@contextmanager
+def secure_cache_directory(*, create: bool = True):
+    """Open and hold the owned private cache directory without following it."""
+    path = cache_dir()
+    parent = path.parent
+    if create:
+        parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    parent_descriptor = os.open(parent, flags)
+    try:
+        parent_metadata = os.fstat(parent_descriptor)
+        if (
+            not stat.S_ISDIR(parent_metadata.st_mode)
+            or parent_metadata.st_uid != os.geteuid()
+        ):
+            raise LocalDataSecurityError(
+                "Cache parent is not an owned directory."
+            )
+        if create:
+            try:
+                os.mkdir(path.name, 0o700, dir_fd=parent_descriptor)
+            except FileExistsError:
+                pass
+        descriptor = os.open(path.name, flags, dir_fd=parent_descriptor)
+    finally:
+        os.close(parent_descriptor)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise LocalDataSecurityError("Cache path is not a directory.")
+        if metadata.st_uid != os.geteuid():
+            raise LocalDataSecurityError("Cache directory is not owned by the current user.")
+        if stat.S_IMODE(metadata.st_mode) & 0o077:
+            os.fchmod(descriptor, 0o700)
+            if stat.S_IMODE(os.fstat(descriptor).st_mode) != 0o700:
+                raise LocalDataSecurityError("Cache directory permissions are not private.")
+        yield descriptor
+    finally:
+        os.close(descriptor)
+
+
+def _open_cache_file(
+    cache_descriptor: int,
+    name: str,
+    *,
+    flags: int = os.O_RDONLY,
+    mode: int = 0o600,
+) -> int:
+    descriptor = os.open(
+        name,
+        flags | os.O_CLOEXEC | os.O_NONBLOCK | os.O_NOFOLLOW,
+        mode,
+        dir_fd=cache_descriptor,
+    )
+    try:
+        _validate_owned_regular_file(descriptor, require_private=True)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _read_cache_json(cache_descriptor: int, name: str) -> object:
+    descriptor = _open_cache_file(cache_descriptor, name)
+    try:
+        content = _read_bounded_descriptor(descriptor, MAX_CACHE_FILE_BYTES)
+        _validate_owned_regular_file(descriptor, require_private=True)
+    finally:
+        os.close(descriptor)
+    return json.loads(content.decode("utf-8"))
+
+
+def _cache_metadata(cache_descriptor: int, name: str) -> os.stat_result | None:
+    try:
+        descriptor = _open_cache_file(cache_descriptor, name)
+    except FileNotFoundError:
+        return None
+    try:
+        return os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _unlink_cache_file(cache_descriptor: int, name: str) -> None:
+    try:
+        descriptor = _open_cache_file(cache_descriptor, name)
+    except FileNotFoundError:
+        return
+    else:
+        os.close(descriptor)
+    os.unlink(name, dir_fd=cache_descriptor)
+
+
 def current_time() -> datetime:
     return datetime.now().astimezone()
 
 
 @contextmanager
-def request_lock():
+def request_lock(cache_descriptor: int):
     """Serialize metadata requests across helper processes."""
-    path = request_lock_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    name = _cache_leaf(request_lock_path())
+    flags = os.O_RDWR | os.O_CREAT
+    try:
+        descriptor = _open_cache_file(cache_descriptor, name, flags=flags)
+    except LocalDataSecurityError:
+        # v0.1.4 created the lock as 0644. Bind it safely first, then tighten
+        # that legacy file through its descriptor before validating again.
+        descriptor = os.open(
+            name,
+            flags | os.O_CLOEXEC | os.O_NONBLOCK | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=cache_descriptor,
+        )
+        try:
+            metadata = _validate_owned_regular_file(descriptor, require_private=False)
+            if stat.S_IMODE(metadata.st_mode) & 0o077:
+                os.fchmod(descriptor, 0o600)
+            _validate_owned_regular_file(descriptor, require_private=True)
+        except BaseException:
+            os.close(descriptor)
+            raise
+    try:
+        os.fchmod(descriptor, 0o600)
+        _validate_owned_regular_file(descriptor, require_private=True)
+        lock_deadline = time.monotonic() + LOCK_WAIT_SECONDS
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= lock_deadline:
+                    raise HelperDeadlineError("Timed out waiting for the request lock.")
+                time.sleep(0.05)
         try:
             yield
         finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
 
 
 def site_date(day: date) -> str:
@@ -370,6 +700,10 @@ def liturgical_color(title: str) -> str:
 
 
 def calendar_url(day: date, version: str, primary: str, secondary: str) -> str:
+    if version not in OFFICE_VERSIONS:
+        raise ValueError("Office version is not supported.")
+    if primary not in OFFICE_LANGUAGES or secondary not in OFFICE_LANGUAGES:
+        raise ValueError("Office language is not supported.")
     return OFFICE_ENDPOINT + "?" + urlencode(
         {
             # This returns only the calendar heading after precedence has
@@ -508,15 +842,24 @@ def parse_metadata(document: str, day: date, source_url: str) -> dict[str, objec
         raise MetadataParseError(
             "Daily feast metadata response did not contain a recognizable liturgical heading."
         )
+    season = find_season(lines) or liturgical_season(day)
+    commemorations = find_commemorations(lines)
+    if (
+        len(title) > 240
+        or len(rank) > 200
+        or len(season) > 120
+        or any(len(commemoration) > 240 for commemoration in commemorations)
+    ):
+        raise MetadataParseError("Daily feast metadata contained an oversized display field.")
     return {
         "date": day.isoformat(),
         "title": title,
         "rank": rank,
-        "season": find_season(lines) or liturgical_season(day),
+        "season": season,
         # Only trust the color on the centered calendar heading; the rest of
         # the Office page uses red extensively for rubrics.
         "color": heading_color or liturgical_color(title),
-        "commemorations": find_commemorations(lines),
+        "commemorations": commemorations,
         "sourceUrl": source_url,
         "fetchedAt": current_time().isoformat(timespec="seconds"),
         "stale": False,
@@ -524,63 +867,262 @@ def parse_metadata(document: str, day: date, source_url: str) -> dict[str, objec
     }
 
 
-def read_cache(path: Path) -> dict[str, object] | None:
+@contextmanager
+def _cache_scope(cache_descriptor: int | None, *, create: bool = True):
+    if cache_descriptor is not None:
+        yield cache_descriptor
+        return
+    with secure_cache_directory(create=create) as opened_descriptor:
+        yield opened_descriptor
+
+
+def _bounded_text(value: object, limit: int, *, allow_empty: bool = True) -> str | None:
+    if not isinstance(value, str) or len(value) > limit:
+        return None
+    if not allow_empty and not value:
+        return None
+    if any(ord(character) < 0x20 and character not in "\t\n\r" for character in value):
+        return None
+    return value
+
+
+def validate_cached_report(payload: object) -> dict[str, object] | None:
+    """Return a narrow, bounded cache schema suitable for JSON/QML output."""
+    if not isinstance(payload, dict) or payload.get("error"):
+        return None
+    cached_date = _bounded_text(payload.get("date"), 10, allow_empty=False)
+    title = _bounded_text(payload.get("title"), 240, allow_empty=False)
+    if cached_date is None or title is None:
+        return None
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(payload, dict) and not payload.get("error"):
+        date.fromisoformat(cached_date)
+    except ValueError:
+        return None
+
+    result: dict[str, object] = {"date": cached_date, "title": title}
+    for key, limit in (
+        ("rank", 200),
+        ("season", 120),
+        ("sourceUrl", 2048),
+        ("fetchedAt", 64),
+    ):
+        value = _bounded_text(payload.get(key), limit)
+        if value is None:
+            return None
+        result[key] = value
+
+    color = payload.get("color", "")
+    if color not in {"", "black", "green", "red", "rose", "violet", "white"}:
+        return None
+    result["color"] = color
+
+    commemorations = payload.get("commemorations", [])
+    if not isinstance(commemorations, list) or len(commemorations) > 4:
+        return None
+    bounded_commemorations: list[str] = []
+    for commemoration in commemorations:
+        value = _bounded_text(commemoration, 240, allow_empty=False)
+        if value is None:
+            return None
+        bounded_commemorations.append(value)
+    result["commemorations"] = bounded_commemorations
+
+    stale = payload.get("stale", False)
+    if not isinstance(stale, bool):
+        return None
+    result["stale"] = stale
+    result["error"] = ""
+    return result
+
+
+def read_cache(
+    path: Path,
+    cache_descriptor: int | None = None,
+    expected_date: date | None = None,
+) -> dict[str, object] | None:
+    try:
+        name = _cache_leaf(path)
+        with _cache_scope(cache_descriptor, create=False) as descriptor:
+            payload = validate_cached_report(_read_cache_json(descriptor, name))
+            if payload is not None and expected_date is not None:
+                if payload["date"] != expected_date.isoformat():
+                    return None
             return payload
-    except (OSError, ValueError, TypeError):
-        pass
-    return None
+    except FileNotFoundError:
+        return None
+    except (
+        UnicodeError,
+        ValueError,
+        TypeError,
+        RecursionError,
+        json.JSONDecodeError,
+    ):
+        return None
 
 
-def write_cache(path: Path, payload: dict[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
-        json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
-        temporary = Path(handle.name)
-    temporary.replace(path)
+def _encoded_cache_payload(payload: dict[str, object]) -> bytes:
+    try:
+        content = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (ValueError, TypeError, RecursionError) as error:
+        raise LocalDataSecurityError("Cache payload is not bounded JSON.") from error
+    if len(content) > MAX_CACHE_FILE_BYTES:
+        raise LocalDataSecurityError(
+            f"Cache payload exceeds the {MAX_CACHE_FILE_BYTES}-byte limit."
+        )
+    return content
 
 
-def prune_cache(reference_day: date) -> None:
+def _write_all(descriptor: int, content: bytes) -> None:
+    offset = 0
+    while offset < len(content):
+        written = os.write(descriptor, content[offset:])
+        if written <= 0:
+            raise OSError("Could not finish writing local state.")
+        offset += written
+
+
+def write_cache(
+    path: Path,
+    payload: dict[str, object],
+    cache_descriptor: int | None = None,
+) -> None:
+    content = _encoded_cache_payload(payload)
+    name = _cache_leaf(path)
+    with _cache_scope(cache_descriptor) as descriptor:
+        # Validate any existing destination before atomically replacing it.
+        _cache_metadata(descriptor, name)
+        temporary_name = f".tmp-{os.getpid()}-{secrets.token_hex(12)}"
+        temporary_descriptor: int | None = None
+        try:
+            temporary_descriptor = os.open(
+                temporary_name,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | os.O_CLOEXEC
+                | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=descriptor,
+            )
+            os.fchmod(temporary_descriptor, 0o600)
+            _validate_owned_regular_file(temporary_descriptor, require_private=True)
+            _write_all(temporary_descriptor, content)
+            os.fsync(temporary_descriptor)
+            _validate_owned_regular_file(temporary_descriptor, require_private=True)
+            os.close(temporary_descriptor)
+            temporary_descriptor = None
+            os.replace(
+                temporary_name,
+                name,
+                src_dir_fd=descriptor,
+                dst_dir_fd=descriptor,
+            )
+            os.fsync(descriptor)
+        finally:
+            if temporary_descriptor is not None:
+                os.close(temporary_descriptor)
+            try:
+                os.unlink(temporary_name, dir_fd=descriptor)
+            except FileNotFoundError:
+                pass
+
+
+def prune_cache(reference_day: date, cache_descriptor: int | None = None) -> None:
     """Keep today and the previous three civil days of successful metadata."""
     cutoff = reference_day - timedelta(days=CACHE_RETENTION_DAYS)
-    for path in cache_dir().glob("report-*.json"):
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            cached_day = date.fromisoformat(str(payload["date"]))
-            if cached_day < cutoff:
-                path.unlink()
-        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
-            continue
+    with _cache_scope(cache_descriptor, create=False) as descriptor:
+        with os.scandir(descriptor) as entries:
+            for index, entry in enumerate(entries):
+                if index >= MAX_CACHE_DIRECTORY_ENTRIES:
+                    break
+                name = entry.name
+                if not re.fullmatch(r"report-[0-9a-f]{16}\.json", name):
+                    continue
+                payload = read_cache(cache_dir() / name, descriptor)
+                if payload is None:
+                    continue
+                try:
+                    cached_day = date.fromisoformat(str(payload["date"]))
+                    if cached_day < cutoff:
+                        _unlink_cache_file(descriptor, name)
+                except (OSError, ValueError, TypeError, KeyError):
+                    continue
 
 
 def latest_cached_report(
-    day: date, version: str, primary: str, secondary: str
+    day: date,
+    version: str,
+    primary: str,
+    secondary: str,
+    cache_descriptor: int | None = None,
 ) -> dict[str, object] | None:
     for days_ago in range(CACHE_RETENTION_DAYS + 1):
-        cached = read_cache(cache_path(day - timedelta(days=days_ago), version, primary, secondary))
+        candidate_day = day - timedelta(days=days_ago)
+        cached = read_cache(
+            cache_path(candidate_day, version, primary, secondary),
+            cache_descriptor,
+            candidate_day,
+        )
         if cached:
             return cached
     return None
 
 
-def read_cooldown(now: datetime | None = None) -> tuple[dict[str, object], datetime] | None:
+def validate_cooldown(payload: object) -> dict[str, object] | None:
+    if not isinstance(payload, dict):
+        return None
+    until = _bounded_text(payload.get("until"), 64, allow_empty=False)
+    kind = payload.get("kind")
+    reason = _bounded_text(payload.get("reason"), 160, allow_empty=False)
+    if until is None or reason is None or kind not in {
+        COOLDOWN_RATE_LIMIT,
+        COOLDOWN_ACCESS_DENIED,
+    }:
+        return None
+    return {"until": until, "kind": kind, "reason": reason}
+
+
+def read_cooldown(
+    now: datetime | None = None,
+    cache_descriptor: int | None = None,
+) -> tuple[dict[str, object], datetime] | None:
     try:
-        payload = json.loads(cooldown_path().read_text(encoding="utf-8"))
-        until = datetime.fromisoformat(str(payload["until"]))
-        current = now or current_time()
-        if until.tzinfo is None:
-            until = until.replace(tzinfo=current.tzinfo)
-        if until > current:
-            return payload, until
-        cooldown_path().unlink(missing_ok=True)
-    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        name = _cache_leaf(cooldown_path())
+        with _cache_scope(cache_descriptor, create=False) as descriptor:
+            payload = validate_cooldown(_read_cache_json(descriptor, name))
+            if payload is None:
+                return None
+            until = datetime.fromisoformat(str(payload["until"]))
+            current = now or current_time()
+            if until.tzinfo is None:
+                until = until.replace(tzinfo=current.tzinfo)
+            if until > current:
+                return payload, until
+            _unlink_cache_file(descriptor, name)
+    except FileNotFoundError:
+        return None
+    except (
+        UnicodeError,
+        ValueError,
+        TypeError,
+        KeyError,
+        RecursionError,
+        json.JSONDecodeError,
+    ):
         pass
     return None
 
 
-def write_cooldown(until: datetime, kind: str = COOLDOWN_RATE_LIMIT) -> None:
+def write_cooldown(
+    until: datetime,
+    kind: str = COOLDOWN_RATE_LIMIT,
+    cache_descriptor: int | None = None,
+) -> None:
     reason = (
         "Divinum Officium access denial"
         if kind == COOLDOWN_ACCESS_DENIED
@@ -593,12 +1135,15 @@ def write_cooldown(until: datetime, kind: str = COOLDOWN_RATE_LIMIT) -> None:
             "kind": kind,
             "reason": reason,
         },
+        cache_descriptor,
     )
 
 
-def clear_cooldown() -> None:
+def clear_cooldown(cache_descriptor: int | None = None) -> None:
     try:
-        cooldown_path().unlink(missing_ok=True)
+        name = _cache_leaf(cooldown_path())
+        with _cache_scope(cache_descriptor, create=False) as descriptor:
+            _unlink_cache_file(descriptor, name)
     except OSError:
         pass
 
@@ -609,7 +1154,7 @@ def retry_after_seconds(error: HTTPError, now: datetime | None = None) -> int:
         try:
             seconds = int(value)
             if seconds > 0:
-                return seconds
+                return min(seconds, MAX_RATE_LIMIT_COOLDOWN_SECONDS)
         except (TypeError, ValueError):
             try:
                 retry_at = parsedate_to_datetime(value)
@@ -618,7 +1163,7 @@ def retry_after_seconds(error: HTTPError, now: datetime | None = None) -> int:
                     retry_at = retry_at.replace(tzinfo=current.tzinfo)
                 seconds = int((retry_at - current).total_seconds())
                 if seconds > 0:
-                    return seconds
+                    return min(seconds, MAX_RATE_LIMIT_COOLDOWN_SECONDS)
             except (TypeError, ValueError, OverflowError):
                 pass
     return DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
@@ -670,6 +1215,10 @@ def read_response_text(response: object, limit: int = MAX_RESPONSE_BYTES) -> str
         return body.decode("utf-8", errors="replace")
 
 
+def open_office_request(request: Request, timeout: float):
+    return OFFICE_OPENER.open(request, timeout=timeout)
+
+
 def fallback_report(
     day: date,
     version: str,
@@ -679,8 +1228,15 @@ def fallback_report(
     message: str,
     cooldown_until: datetime | None = None,
     cooldown_kind: str | None = None,
+    cache_descriptor: int | None = None,
+    use_cache: bool = True,
 ) -> dict[str, object]:
-    stale = latest_cached_report(day, version, primary, secondary)
+    message = message[:1024]
+    stale = (
+        latest_cached_report(day, version, primary, secondary, cache_descriptor)
+        if use_cache
+        else None
+    )
     if stale:
         payload = dict(stale)
         payload["stale"] = True
@@ -706,10 +1262,13 @@ def fallback_report(
     return payload
 
 
-def cache_mtime(path: Path) -> int | None:
+def cache_mtime(path: Path, cache_descriptor: int | None = None) -> int | None:
     try:
-        return path.stat().st_mtime_ns
-    except OSError:
+        name = _cache_leaf(path)
+        with _cache_scope(cache_descriptor, create=False) as descriptor:
+            metadata = _cache_metadata(descriptor, name)
+            return metadata.st_mtime_ns if metadata else None
+    except FileNotFoundError:
         return None
 
 
@@ -722,15 +1281,65 @@ def fetch_report(
     force: bool = False,
 ) -> dict[str, object]:
     path = cache_path(day, version, primary, secondary)
-    initial_mtime = cache_mtime(path)
+    url = calendar_url(day, version, primary, secondary)
+    try:
+        with secure_cache_directory() as cache_descriptor:
+            return _fetch_report_with_cache(
+                day,
+                version,
+                primary,
+                secondary,
+                min(max(0.1, timeout), 8.0),
+                force,
+                path,
+                url,
+                cache_descriptor,
+            )
+    except HelperDeadlineError as error:
+        return fallback_report(
+            day,
+            version,
+            primary,
+            secondary,
+            url,
+            str(error),
+            use_cache=False,
+        )
+    except OSError:
+        return fallback_report(
+            day,
+            version,
+            primary,
+            secondary,
+            url,
+            "Local metadata state failed its safety checks; no request was made.",
+            use_cache=False,
+        )
+
+
+def _fetch_report_with_cache(
+    day: date,
+    version: str,
+    primary: str,
+    secondary: str,
+    timeout: float,
+    force: bool,
+    path: Path,
+    url: str,
+    cache_descriptor: int,
+) -> dict[str, object]:
+    report_metadata = _cache_metadata(cache_descriptor, _cache_leaf(path))
+    if report_metadata is not None and report_metadata.st_size > MAX_CACHE_FILE_BYTES:
+        raise LocalDataSecurityError("Cached report exceeds its byte limit.")
+    initial_mtime = cache_mtime(path, cache_descriptor)
     if not force:
-        cached = read_cache(path)
+        cached = read_cache(path, cache_descriptor, day)
         if cached:
             return cached
 
-    with request_lock():
-        cached = read_cache(path)
-        current_mtime = cache_mtime(path)
+    with request_lock(cache_descriptor):
+        cached = read_cache(path, cache_descriptor, day)
+        current_mtime = cache_mtime(path, cache_descriptor)
         if not force and cached:
             return cached
         # A concurrent forced or initial request populated this cache while
@@ -738,9 +1347,14 @@ def fetch_report(
         if cached and current_mtime != initial_mtime:
             return cached
 
-        url = calendar_url(day, version, primary, secondary)
         now = current_time()
-        cooldown = read_cooldown(now)
+        cooldown_metadata = _cache_metadata(
+            cache_descriptor,
+            _cache_leaf(cooldown_path()),
+        )
+        if cooldown_metadata is not None and cooldown_metadata.st_size > MAX_CACHE_FILE_BYTES:
+            raise LocalDataSecurityError("Cooldown state exceeds its byte limit.")
+        cooldown = read_cooldown(now, cache_descriptor)
         if cooldown:
             cooldown_payload, until = cooldown
             cooldown_kind = str(
@@ -756,6 +1370,7 @@ def fetch_report(
                 cooldown_message(cooldown_kind, retry_time),
                 until,
                 cooldown_kind,
+                cache_descriptor,
             )
 
         request = Request(
@@ -766,7 +1381,7 @@ def fetch_report(
             },
         )
         try:
-            with urlopen(request, timeout=timeout) as response:
+            with open_office_request(request, timeout) as response:
                 document = read_response_text(response)
             payload = parse_metadata(document, day, url)
         except HTTPError as error:
@@ -783,7 +1398,7 @@ def fetch_report(
                 )
                 until = now + timedelta(seconds=cooldown_seconds)
                 try:
-                    write_cooldown(until, cooldown_kind)
+                    write_cooldown(until, cooldown_kind, cache_descriptor)
                 except OSError:
                     pass
                 retry_time = until.astimezone().strftime("%H:%M")
@@ -796,6 +1411,7 @@ def fetch_report(
                     cooldown_message(cooldown_kind, retry_time),
                     until,
                     cooldown_kind,
+                    cache_descriptor,
                 )
             return fallback_report(
                 day,
@@ -804,6 +1420,7 @@ def fetch_report(
                 secondary,
                 url,
                 f"Daily feast metadata unavailable: {error}",
+                cache_descriptor=cache_descriptor,
             )
         except (ResponseTooLargeError, MetadataParseError) as error:
             return fallback_report(
@@ -813,6 +1430,7 @@ def fetch_report(
                 secondary,
                 url,
                 str(error),
+                cache_descriptor=cache_descriptor,
             )
         except (URLError, TimeoutError, OSError) as error:
             return fallback_report(
@@ -822,12 +1440,13 @@ def fetch_report(
                 secondary,
                 url,
                 f"Daily feast metadata unavailable: {error}",
+                cache_descriptor=cache_descriptor,
             )
 
         try:
-            write_cache(path, payload)
-            clear_cooldown()
-            prune_cache(day)
+            write_cache(path, payload, cache_descriptor)
+            clear_cooldown(cache_descriptor)
+            prune_cache(day, cache_descriptor)
         except OSError:
             # A read-only or full cache should not hide otherwise valid data.
             pass
@@ -839,9 +1458,21 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     report = subparsers.add_parser("report", help="Print today's liturgical metadata as JSON")
     report.add_argument("--date", default=date.today().isoformat(), help="Civil date in YYYY-MM-DD form")
-    report.add_argument("--version", default="Tridentine - 1570")
-    report.add_argument("--primary-language", default="Latin")
-    report.add_argument("--secondary-language", default="English")
+    report.add_argument(
+        "--version",
+        choices=OFFICE_VERSIONS,
+        default="Tridentine - 1570",
+    )
+    report.add_argument(
+        "--primary-language",
+        choices=OFFICE_LANGUAGES,
+        default="Latin",
+    )
+    report.add_argument(
+        "--secondary-language",
+        choices=OFFICE_LANGUAGES,
+        default="English",
+    )
     report.add_argument("--timeout", type=float, default=8.0)
     report.add_argument(
         "--force",
@@ -854,13 +1485,30 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def emit_json(payload: dict[str, object]) -> None:
+    """Write exactly one JSON result while enforcing the QML producer ceiling."""
+    try:
+        content = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (ValueError, TypeError, RecursionError):
+        content = b'{"error":"Helper produced invalid JSON."}'
+    if len(content) > MAX_HELPER_OUTPUT_BYTES:
+        content = b'{"error":"Helper output exceeded its safety limit."}'
+    sys.stdout.write(content.decode("utf-8"))
+    sys.stdout.flush()
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command in {"report", "solar"}:
         try:
             requested_day = date.fromisoformat(args.date)
         except ValueError:
-            print(json.dumps({"error": "Date must use YYYY-MM-DD."}))
+            emit_json({"error": "Date must use YYYY-MM-DD."})
             return 2
     if args.command == "report":
         payload = fetch_report(
@@ -871,14 +1519,27 @@ def main(argv: list[str] | None = None) -> int:
             max(0.1, args.timeout),
             force=args.force,
         )
-        print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+        emit_json(payload)
         return 0
     if args.command == "solar":
         payload = solar_report(requested_day, args.weather_state)
-        print(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+        emit_json(payload)
         return 0
     return 2
 
 
+def run_cli() -> int:
+    """Install output ceilings before parsing or touching local/external data."""
+    sys.stdout = BoundedTextStream(sys.stdout, MAX_HELPER_OUTPUT_BYTES)  # type: ignore[assignment]
+    sys.stderr = BoundedTextStream(sys.stderr, MAX_HELPER_STDERR_BYTES)  # type: ignore[assignment]
+    try:
+        return main()
+    except BrokenPipeError:
+        return 1
+    except Exception:
+        emit_json({"error": "Metadata helper failed safely."})
+        return 1
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run_cli())

@@ -61,6 +61,21 @@ CALENDAR_DOCUMENT = """
 """
 
 
+def cached_report(day: date, title: str = "Cached feast") -> dict[str, object]:
+    return {
+        "date": day.isoformat(),
+        "title": title,
+        "rank": "Duplex",
+        "season": "Time after Pentecost",
+        "color": "white",
+        "commemorations": [],
+        "sourceUrl": "https://www.divinumofficium.com/",
+        "fetchedAt": "2026-08-29T12:00:00+00:00",
+        "stale": False,
+        "error": "",
+    }
+
+
 class MetadataTests(unittest.TestCase):
     def test_calendar_url_requests_only_the_lightweight_heading(self):
         result = omadivoff.calendar_url(
@@ -140,9 +155,9 @@ class MetadataTests(unittest.TestCase):
             "<body>Cloudflare challenge</body></html>"
         )
         with tempfile.TemporaryDirectory() as directory:
-            cache_directory = Path(directory)
+            cache_directory = Path(directory) / "omadivoff"
             with patch.object(omadivoff, "cache_dir", return_value=cache_directory):
-                with patch.object(omadivoff, "urlopen", return_value=response):
+                with patch.object(omadivoff, "open_office_request", return_value=response):
                     report = omadivoff.fetch_report(
                         date(2026, 8, 29),
                         "Tridentine - 1570",
@@ -178,17 +193,25 @@ class MetadataTests(unittest.TestCase):
 
     def test_cache_round_trip(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "report.json"
-            payload = {"title": "Test feast", "stale": False}
-            omadivoff.write_cache(path, payload)
-            self.assertEqual(payload, omadivoff.read_cache(path))
+            cache_directory = Path(directory) / "omadivoff"
+            payload = cached_report(date(2026, 8, 29), "Test feast")
+            with patch.object(omadivoff, "cache_dir", return_value=cache_directory):
+                path = omadivoff.cache_path(
+                    date(2026, 8, 29), "Tridentine - 1570", "Latin", "English"
+                )
+                omadivoff.write_cache(path, payload)
+                self.assertEqual(payload, omadivoff.read_cache(path))
 
     def test_successful_report_is_requested_only_once_per_civil_day(self):
         with tempfile.TemporaryDirectory() as directory:
-            with patch.object(omadivoff, "cache_dir", return_value=Path(directory)):
+            with patch.object(
+                omadivoff,
+                "cache_dir",
+                return_value=Path(directory) / "omadivoff",
+            ):
                 with patch.object(
                     omadivoff,
-                    "urlopen",
+                    "open_office_request",
                     side_effect=lambda *args, **kwargs: FakeResponse(CALENDAR_DOCUMENT),
                 ) as mocked_open:
                     first = omadivoff.fetch_report(
@@ -217,9 +240,9 @@ class MetadataTests(unittest.TestCase):
     def test_oversized_response_is_rejected_without_writing_a_success_cache(self):
         response = FakeResponse("x" * (omadivoff.MAX_RESPONSE_BYTES + 1))
         with tempfile.TemporaryDirectory() as directory:
-            cache_directory = Path(directory)
+            cache_directory = Path(directory) / "omadivoff"
             with patch.object(omadivoff, "cache_dir", return_value=cache_directory):
-                with patch.object(omadivoff, "urlopen", return_value=response):
+                with patch.object(omadivoff, "open_office_request", return_value=response):
                     report = omadivoff.fetch_report(
                         date(2026, 8, 29),
                         "Tridentine - 1570",
@@ -254,20 +277,22 @@ class MetadataTests(unittest.TestCase):
         current_day = date(2026, 8, 30)
         previous_day = current_day - timedelta(days=1)
         with tempfile.TemporaryDirectory() as directory:
-            with patch.object(omadivoff, "cache_dir", return_value=Path(directory)):
+            with patch.object(
+                omadivoff,
+                "cache_dir",
+                return_value=Path(directory) / "omadivoff",
+            ):
                 omadivoff.write_cache(
                     omadivoff.cache_path(
                         previous_day, "Tridentine - 1570", "Latin", "English"
                     ),
-                    {
-                        "date": previous_day.isoformat(),
-                        "title": "Cached feast",
-                        "rank": "Duplex",
-                        "error": "",
-                        "stale": False,
-                    },
+                    cached_report(previous_day),
                 )
-                with patch.object(omadivoff, "urlopen", side_effect=OSError("offline")):
+                with patch.object(
+                    omadivoff,
+                    "open_office_request",
+                    side_effect=OSError("offline"),
+                ):
                     report = omadivoff.fetch_report(
                         current_day, "Tridentine - 1570", "Latin", "English", 0.1
                     )
@@ -289,9 +314,14 @@ class MetadataTests(unittest.TestCase):
         )
         self.addCleanup(error.close)
         with tempfile.TemporaryDirectory() as directory:
-            with patch.object(omadivoff, "cache_dir", return_value=Path(directory)):
+            cache_directory = Path(directory) / "omadivoff"
+            with patch.object(omadivoff, "cache_dir", return_value=cache_directory):
                 with patch.object(omadivoff, "current_time", return_value=now):
-                    with patch.object(omadivoff, "urlopen", side_effect=error) as mocked_open:
+                    with patch.object(
+                        omadivoff,
+                        "open_office_request",
+                        side_effect=error,
+                    ) as mocked_open:
                         first = omadivoff.fetch_report(
                             date(2026, 8, 31),
                             "Tridentine - 1570",
@@ -308,7 +338,7 @@ class MetadataTests(unittest.TestCase):
                             force=True,
                         )
 
-                cooldown = json.loads((Path(directory) / "rate-limit.json").read_text())
+                cooldown = json.loads((cache_directory / "rate-limit.json").read_text())
 
         self.assertEqual(1, mocked_open.call_count)
         self.assertEqual("2026-08-31T12:02:00+00:00", cooldown["until"])
@@ -321,9 +351,14 @@ class MetadataTests(unittest.TestCase):
         error = HTTPError("https://example.test", 403, "Forbidden", {}, None)
         self.addCleanup(error.close)
         with tempfile.TemporaryDirectory() as directory:
-            with patch.object(omadivoff, "cache_dir", return_value=Path(directory)):
+            cache_directory = Path(directory) / "omadivoff"
+            with patch.object(omadivoff, "cache_dir", return_value=cache_directory):
                 with patch.object(omadivoff, "current_time", return_value=now):
-                    with patch.object(omadivoff, "urlopen", side_effect=error) as mocked_open:
+                    with patch.object(
+                        omadivoff,
+                        "open_office_request",
+                        side_effect=error,
+                    ) as mocked_open:
                         first = omadivoff.fetch_report(
                             date(2026, 9, 1),
                             "Tridentine - 1570",
@@ -340,7 +375,7 @@ class MetadataTests(unittest.TestCase):
                             force=True,
                         )
 
-                cooldown = json.loads((Path(directory) / "rate-limit.json").read_text())
+                cooldown = json.loads((cache_directory / "rate-limit.json").read_text())
 
         self.assertEqual(1, mocked_open.call_count)
         self.assertEqual("access-denied", cooldown["kind"])
@@ -375,11 +410,15 @@ class MetadataTests(unittest.TestCase):
         error = HTTPError("https://example.test", 429, "Too Many Requests", {}, None)
         self.addCleanup(error.close)
         with tempfile.TemporaryDirectory() as directory:
-            with patch.object(omadivoff, "cache_dir", return_value=Path(directory)):
+            with patch.object(
+                omadivoff,
+                "cache_dir",
+                return_value=Path(directory) / "omadivoff",
+            ):
                 with patch.object(omadivoff, "current_time", side_effect=lambda: clock[0]):
                     with patch.object(
                         omadivoff,
-                        "urlopen",
+                        "open_office_request",
                         side_effect=[error, FakeResponse(CALENDAR_DOCUMENT)],
                     ) as mocked_open:
                         omadivoff.fetch_report(
@@ -406,7 +445,11 @@ class MetadataTests(unittest.TestCase):
     def test_cache_pruning_retains_only_today_and_previous_three_days(self):
         current_day = date(2026, 8, 31)
         with tempfile.TemporaryDirectory() as directory:
-            with patch.object(omadivoff, "cache_dir", return_value=Path(directory)):
+            with patch.object(
+                omadivoff,
+                "cache_dir",
+                return_value=Path(directory) / "omadivoff",
+            ):
                 retained = omadivoff.cache_path(
                     current_day - timedelta(days=3),
                     "Tridentine - 1570",
@@ -425,11 +468,7 @@ class MetadataTests(unittest.TestCase):
                 ):
                     omadivoff.write_cache(
                         path,
-                        {
-                            "date": cached_day.isoformat(),
-                            "title": "Cached feast",
-                            "error": "",
-                        },
+                        cached_report(cached_day),
                     )
                 omadivoff.prune_cache(current_day)
 
@@ -446,8 +485,16 @@ class MetadataTests(unittest.TestCase):
             return FakeResponse(CALENDAR_DOCUMENT)
 
         with tempfile.TemporaryDirectory() as directory:
-            with patch.object(omadivoff, "cache_dir", return_value=Path(directory)):
-                with patch.object(omadivoff, "urlopen", side_effect=slow_response) as mocked_open:
+            with patch.object(
+                omadivoff,
+                "cache_dir",
+                return_value=Path(directory) / "omadivoff",
+            ):
+                with patch.object(
+                    omadivoff,
+                    "open_office_request",
+                    side_effect=slow_response,
+                ) as mocked_open:
                     with ThreadPoolExecutor(max_workers=2) as executor:
                         first = executor.submit(
                             omadivoff.fetch_report,
@@ -475,8 +522,16 @@ class MetadataTests(unittest.TestCase):
 
     def test_report_falls_back_cleanly_when_offline(self):
         with tempfile.TemporaryDirectory() as directory:
-            with patch.object(omadivoff, "cache_dir", return_value=Path(directory)):
-                with patch.object(omadivoff, "urlopen", side_effect=OSError("offline")):
+            with patch.object(
+                omadivoff,
+                "cache_dir",
+                return_value=Path(directory) / "omadivoff",
+            ):
+                with patch.object(
+                    omadivoff,
+                    "open_office_request",
+                    side_effect=OSError("offline"),
+                ):
                     report = omadivoff.fetch_report(
                         date(2026, 8, 29), "Tridentine - 1570", "Latin", "English", 0.1
                     )

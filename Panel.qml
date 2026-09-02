@@ -61,19 +61,83 @@ Panel {
   readonly property int nextIndex: Model.nextHourIndex(currentIndex, hours)
   readonly property var currentHour: currentIndex >= 0 ? hours[currentIndex] : null
   readonly property var nextHour: nextIndex >= 0 ? hours[nextIndex] : null
-  readonly property string version: String(setting("version", "Tridentine - 1570"))
-  readonly property string primaryLanguage: String(setting("primaryLanguage", "Latin"))
-  readonly property string secondaryLanguage: String(setting("secondaryLanguage", "English"))
+  readonly property string version: safeOption(
+    setting("version", "Tridentine - 1570"),
+    versionOptions,
+    "Tridentine - 1570"
+  )
+  readonly property string primaryLanguage: safeOption(
+    setting("primaryLanguage", "Latin"),
+    languageOptions,
+    "Latin"
+  )
+  readonly property string secondaryLanguage: safeOption(
+    setting("secondaryLanguage", "English"),
+    languageOptions,
+    "English"
+  )
   readonly property bool showHourName: setting("showCurrentHourInBar", true) === true
   readonly property string barLabel: currentHour ? currentHour.name : "Office"
   readonly property string tooltipText: nextHour
     ? currentHour.name + " · " + nextHour.name + " " + Model.remainingLabel(Model.minutesUntilNext(now, currentIndex, hours))
     : "Divine Office"
-  readonly property string helperPath: String(Qt.resolvedUrl("omadivoff.py")).replace(/^file:\/\//, "")
+  readonly property string helperPath: decodeURIComponent(
+    String(Qt.resolvedUrl("omadivoff.py")).replace(/^file:\/\//, "")
+  )
+  readonly property int maxHelperOutputCharacters: 64 * 1024
+  readonly property int maxHelperStderrCharacters: 8 * 1024
   readonly property string reportStatusText: reportStatusMessage()
 
   function setting(key, fallback) {
     return settings && settings[key] !== undefined ? settings[key] : fallback
+  }
+
+  function safeOption(value, options, fallback) {
+    var candidate = typeof value === "string" ? value : ""
+    return options.indexOf(candidate) >= 0 ? candidate : fallback
+  }
+
+  function appendBounded(process, chunk, limit, stderr) {
+    var value = String(chunk || "")
+    var sizeProperty = stderr ? "stderrSize" : "stdoutSize"
+    var overflowProperty = stderr ? "stderrOverflow" : "stdoutOverflow"
+    var bufferProperty = stderr ? "stderrBuffer" : "stdoutBuffer"
+    var remaining = Math.max(0, limit - process[sizeProperty])
+    if (remaining > 0)
+      process[bufferProperty] += value.slice(0, remaining)
+    process[sizeProperty] += Math.min(value.length, remaining)
+    if (value.length > remaining)
+      process[overflowProperty] = true
+  }
+
+  function resetProcessState(process) {
+    process.stdoutBuffer = ""
+    process.stderrBuffer = ""
+    process.stdoutSize = 0
+    process.stderrSize = 0
+    process.stdoutOverflow = false
+    process.stderrOverflow = false
+    process.exitHandled = false
+    process.timedOut = false
+    process.processGroupId = 0
+  }
+
+  function signalProcessTree(process, signalName) {
+    var groupId = Number(process.processGroupId)
+    if (!isFinite(groupId) || groupId <= 1 || Math.floor(groupId) !== groupId) {
+      // Never pass a not-yet-started PID of zero to kill(2); zero targets the
+      // caller's entire process group. Quickshell safely owns teardown until
+      // onStarted records timeout's positive PID.
+      return
+    }
+
+    // GNU timeout starts itself and the helper in a process group whose ID is
+    // timeout's PID, captured by onStarted before Quickshell can clear it.
+    // Signal the recorded group even after the supervisor exits so it cannot
+    // leave an orphaned helper or descendant behind.
+    Quickshell.execDetached([
+      "/usr/bin/kill", "-" + signalName, "--", "-" + String(groupId)
+    ])
   }
 
   function liturgicalColor(value) {
@@ -229,11 +293,13 @@ Panel {
 
   function refresh(force) {
     if (reportProc.running) return
+    root.resetProcessState(reportProc)
     root.reportRequestKey = root.currentReportRequestKey()
     root.loading = true
     root.reportError = ""
     var command = [
-      "python3", root.helperPath, "report",
+      "/usr/bin/timeout", "--signal=TERM", "--kill-after=2s", "15s",
+      "/usr/bin/python3", "-I", root.helperPath, "report",
       "--date", Model.isoDate(root.now),
       "--version", root.version,
       "--primary-language", root.primaryLanguage,
@@ -242,15 +308,19 @@ Panel {
     if (force === true) command.push("--force")
     reportProc.command = command
     reportProc.running = true
+    reportWatchdog.restart()
   }
 
   function refreshSolar() {
     if (solarProc.running) return
+    root.resetProcessState(solarProc)
     solarProc.command = [
-      "python3", root.helperPath, "solar",
+      "/usr/bin/timeout", "--signal=TERM", "--kill-after=1s", "4s",
+      "/usr/bin/python3", "-I", root.helperPath, "solar",
       "--date", Model.isoDate(root.now)
     ]
     solarProc.running = true
+    solarWatchdog.restart()
   }
 
   function openExternal(url) {
@@ -279,40 +349,151 @@ Panel {
 
   Process {
     id: reportProc
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var parsed = Model.parseReport(text)
-        if (parsed) {
-          root.report = parsed
-          root.reportError = parsed.error || ""
-        } else {
-          root.reportError = "Could not read the daily liturgical metadata."
-        }
+    property string stdoutBuffer: ""
+    property string stderrBuffer: ""
+    property int stdoutSize: 0
+    property int stderrSize: 0
+    property bool stdoutOverflow: false
+    property bool stderrOverflow: false
+    property bool exitHandled: false
+    property bool timedOut: false
+    property int processGroupId: 0
+    onStarted: processGroupId = Number(processId)
+    stdout: SplitParser {
+      splitMarker: ""
+      onRead: function(chunk) {
+        root.appendBounded(reportProc, chunk, root.maxHelperOutputCharacters, false)
       }
     }
-    onExited: function(exitCode) {
+    stderr: SplitParser {
+      splitMarker: ""
+      onRead: function(chunk) {
+        root.appendBounded(reportProc, chunk, root.maxHelperStderrCharacters, true)
+      }
+    }
+    onExited: function(exitCode, exitStatus) {
+      reportProc.exitHandled = true
+      if (exitStatus !== 0)
+        root.signalProcessTree(reportProc, "KILL")
+      reportProc.processGroupId = 0
+      reportWatchdog.stop()
+      reportKillTimer.stop()
       root.loading = false
-      if (exitCode !== 0 && root.reportError === "")
+      if (reportProc.stdoutOverflow || reportProc.stderrOverflow) {
+        root.reportError = "The metadata helper exceeded its output safety limit."
+        return
+      }
+      var parsed = Model.parseReport(reportProc.stdoutBuffer, "metadata")
+      if (parsed) {
+        root.report = parsed
+        root.reportError = parsed.error || ""
+      } else if (reportProc.timedOut || exitCode === 124) {
+        root.reportError = "The metadata helper timed out."
+      } else if (exitCode !== 0) {
         root.reportError = "Divinum Officium is temporarily unavailable."
+      } else {
+        root.reportError = "Could not read the daily liturgical metadata."
+      }
+    }
+    onRunningChanged: {
+      if (!running && !exitHandled && root.loading) {
+        reportWatchdog.stop()
+        reportKillTimer.stop()
+        reportProc.processGroupId = 0
+        root.loading = false
+        root.reportError = "Could not start the metadata helper."
+      }
     }
   }
 
   Process {
     id: solarProc
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var parsed = Model.parseReport(text)
-        root.solarReport = parsed || {
-          error: "Could not calculate the local solar schedule."
-        }
+    property string stdoutBuffer: ""
+    property string stderrBuffer: ""
+    property int stdoutSize: 0
+    property int stderrSize: 0
+    property bool stdoutOverflow: false
+    property bool stderrOverflow: false
+    property bool exitHandled: false
+    property bool timedOut: false
+    property int processGroupId: 0
+    onStarted: processGroupId = Number(processId)
+    stdout: SplitParser {
+      splitMarker: ""
+      onRead: function(chunk) {
+        root.appendBounded(solarProc, chunk, root.maxHelperOutputCharacters, false)
       }
     }
-    onExited: function(exitCode) {
-      if (exitCode !== 0 && (!root.solarReport || !root.solarReport.error))
-        root.solarReport = { error: "Could not calculate the local solar schedule." }
+    stderr: SplitParser {
+      splitMarker: ""
+      onRead: function(chunk) {
+        root.appendBounded(solarProc, chunk, root.maxHelperStderrCharacters, true)
+      }
     }
+    onExited: function(exitCode, exitStatus) {
+      solarProc.exitHandled = true
+      if (exitStatus !== 0)
+        root.signalProcessTree(solarProc, "KILL")
+      solarProc.processGroupId = 0
+      solarWatchdog.stop()
+      solarKillTimer.stop()
+      if (solarProc.stdoutOverflow || solarProc.stderrOverflow) {
+        root.solarReport = { error: "The solar helper exceeded its output safety limit." }
+        return
+      }
+      var parsed = Model.parseReport(solarProc.stdoutBuffer, "solar")
+      if (parsed) {
+        root.solarReport = parsed
+      } else if (solarProc.timedOut || exitCode === 124) {
+        root.solarReport = { error: "The solar helper timed out." }
+      } else {
+        root.solarReport = { error: "Could not calculate the local solar schedule." }
+      }
+    }
+    onRunningChanged: {
+      if (!running && !exitHandled) {
+        solarWatchdog.stop()
+        solarKillTimer.stop()
+        solarProc.processGroupId = 0
+        root.solarReport = { error: "Could not start the solar helper." }
+      }
+    }
+  }
+
+  Timer {
+    id: reportWatchdog
+    interval: 18000
+    onTriggered: {
+      if (!reportProc.running) return
+      reportProc.timedOut = true
+      root.reportError = "The metadata helper timed out."
+      root.signalProcessTree(reportProc, "TERM")
+      reportKillTimer.restart()
+    }
+  }
+
+  Timer {
+    id: reportKillTimer
+    interval: 2500
+    onTriggered: root.signalProcessTree(reportProc, "KILL")
+  }
+
+  Timer {
+    id: solarWatchdog
+    interval: 7000
+    onTriggered: {
+      if (!solarProc.running) return
+      solarProc.timedOut = true
+      root.solarReport = { error: "The solar helper timed out." }
+      root.signalProcessTree(solarProc, "TERM")
+      solarKillTimer.restart()
+    }
+  }
+
+  Timer {
+    id: solarKillTimer
+    interval: 1500
+    onTriggered: root.signalProcessTree(solarProc, "KILL")
   }
 
   Timer {
@@ -331,6 +512,13 @@ Panel {
 
   Component.onCompleted: {
     refreshSolar()
+  }
+
+  Component.onDestruction: {
+    if (reportProc.running && reportProc.processGroupId > 1)
+      root.signalProcessTree(reportProc, "KILL")
+    if (solarProc.running && solarProc.processGroupId > 1)
+      root.signalProcessTree(solarProc, "KILL")
   }
 
   KeyboardPanel {

@@ -12,7 +12,7 @@ An unofficial [Divinum Officium](https://www.divinumofficium.com/) client for tr
 - The day's feast or Sunday, rank, liturgical season and color, and commemorations.
 - A feast-title link to the corresponding date in CatholicSaints.Info's public 1914 Roman Martyrology.
 - Fixed custom hour boundaries or a sunrise-and-sunset schedule based on the location configured in Omarchy Weather.
-- One bounded metadata request when the panel first opens each day, with a three-day cache, stale-data fallback, and persistent request cooldowns.
+- One bounded metadata request when the panel first opens each day, with a three-day cache, stale-data fallback, persistent request cooldowns, and total helper deadlines.
 
 ### Settings
 
@@ -78,15 +78,19 @@ The optional solar schedule places Matins at the eighth hour of night, Lauds at 
 
 ## Dependencies and network access
 
-The plugin requires Omarchy's Quickshell bar and Python 3; it uses only Python's standard library. The first time the panel is opened each civil day for the selected rubrics and languages, its metadata helper requests the lightweight calendar heading from `www.divinumofficium.com`. Loading the shell does not make this request. A settings change or explicit manual refresh can request a new heading, but an active request cooldown is always enforced. The plugin does not prefetch complete Office or Mass pages; those are opened only when clicked.
+The plugin requires Omarchy's Quickshell bar, Python 3, and GNU `timeout` from coreutils; it otherwise uses only Python's standard library. The first time the panel is opened each civil day for the selected rubrics and languages, its metadata helper requests the lightweight calendar heading from `www.divinumofficium.com`. Loading the shell does not make this request. A settings change or explicit manual refresh can request a new heading, but an active request cooldown is always enforced. The plugin does not prefetch complete Office or Mass pages; those are opened only when clicked.
 
-Successful metadata is retained for today and the previous three days. During an outage, the most recent matching result remains visible. Every response is read with a 256 KiB limit, including responses without a trustworthy `Content-Length` header. An HTTP 429 response creates a persistent cooldown using the server's `Retry-After` value, or one hour when none is provided. An HTTP 403 response creates a six-hour access-denied cooldown. This prevents panel or shell restarts from repeatedly contacting the service. The panel shows when an active pause ends; once it has ended, the message changes to a manual retry prompt.
+Successful metadata is retained for today and the previous three days. During an outage, the most recent matching result remains visible. Every response is read with a 256 KiB limit, including responses without a trustworthy `Content-Length` header. Cache files are limited to 64 KiB and held under an owned `0700` directory as owned, single-link `0600` regular files. Reads, locks, pruning, and durable atomic replacements remain bound to that directory descriptor and do not follow links. If the cache or lock fails those checks, the helper fails closed without making a metadata request.
+
+The Weather state used for the optional solar schedule is also opened without following links, required to be an owned single-link regular file, and limited to 16 KiB before UTF-8/JSON decoding. Its coordinates and display name are schema-checked and bounded before reaching QML. Both helpers use bounded stdout/stderr producers and streaming consumers, run under process-group deadlines, and escalate from `TERM` to `KILL` so a stalled helper or descendant cannot hold the bar indefinitely.
+
+An HTTP 429 response creates a persistent cooldown using the server's `Retry-After` value, capped at one day, or one hour when none is provided. An HTTP 403 response creates a six-hour access-denied cooldown. This prevents panel or shell restarts from repeatedly contacting the service. The panel shows when an active pause ends; once it has ended, the message changes to a manual retry prompt. Metadata redirects are accepted only when they remain on the same HTTPS Divinum Officium origin.
 
 Divinum Officium is currently protected by Cloudflare after [upstream work to control bot-driven hosting costs](https://github.com/DivinumOfficium/divinum-officium/issues/5003). It may deny automated metadata requests—or even browser visits from some networks—with HTTP 403. That decision is made by the upstream site, not by this plugin's daily cache. When it happens, the plugin uses the newest matching cached metadata if one exists and offers a homepage fallback for direct links that Cloudflare blocks.
 
 Solar events are calculated locally from the coordinates already configured in Omarchy Weather. Those coordinates are not sent to Divinum Officium or another service by this plugin.
 
-Results and request-cooldown state are cached under `${XDG_CACHE_HOME:-~/.cache}/omadivoff`.
+Results and request-cooldown state are cached under `${XDG_CACHE_HOME:-~/.cache}/omadivoff` with private permissions.
 
 ## Remove
 

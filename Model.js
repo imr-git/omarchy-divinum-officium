@@ -151,10 +151,98 @@ function massUrl(date, version, primaryLanguage, secondaryLanguage) {
   })
 }
 
-function parseReport(raw) {
+function boundedString(value, maximum, allowEmpty) {
+  return typeof value === "string"
+    && value.length <= maximum
+    && (allowEmpty || value.length > 0)
+}
+
+function validTime(value) {
+  return boundedString(value, 5, false) && /^([01]\d|2[0-3]):[0-5]\d$/.test(value)
+}
+
+function validErrorPayload(parsed) {
+  return Object.keys(parsed).length === 1
+    && boundedString(parsed.error, 1024, false)
+}
+
+function validMetadataReport(parsed) {
+  if (boundedString(parsed.error, 1024, false) && parsed.title === undefined)
+    return validErrorPayload(parsed)
+  if (!boundedString(parsed.date, 10, false)
+      || !/^\d{4}-\d{2}-\d{2}$/.test(parsed.date)
+      || !boundedString(parsed.title, 240, false)
+      || !boundedString(parsed.rank, 200, true)
+      || !boundedString(parsed.season, 120, true)
+      || !boundedString(parsed.sourceUrl, 2048, true)
+      || !boundedString(parsed.fetchedAt, 64, true)
+      || !boundedString(parsed.error, 1024, true)
+      || typeof parsed.stale !== "boolean")
+    return false
+  if (["", "black", "green", "red", "rose", "violet", "white"].indexOf(parsed.color) < 0)
+    return false
+  if (!Array.isArray(parsed.commemorations) || parsed.commemorations.length > 4)
+    return false
+  for (var i = 0; i < parsed.commemorations.length; i++)
+    if (!boundedString(parsed.commemorations[i], 240, false)) return false
+  if (parsed.requestedDate !== undefined
+      && (!boundedString(parsed.requestedDate, 10, false)
+        || !/^\d{4}-\d{2}-\d{2}$/.test(parsed.requestedDate)))
+    return false
+  if (parsed.cooldownUntil !== undefined
+      && !boundedString(parsed.cooldownUntil, 64, false))
+    return false
+  if (parsed.cooldownKind !== undefined
+      && ["rate-limit", "access-denied"].indexOf(parsed.cooldownKind) < 0)
+    return false
+  return true
+}
+
+function validSolarReport(parsed) {
+  if (!boundedString(parsed.date, 10, false)
+      || !/^\d{4}-\d{2}-\d{2}$/.test(parsed.date)
+      || !boundedString(parsed.error, 1024, true))
+    return false
+  if (parsed.error !== "" && parsed.schedule === undefined)
+    return parsed.location === undefined || validSolarLocation(parsed.location)
+  if (!validSolarLocation(parsed.location)
+      || !validTime(parsed.sunrise)
+      || !validTime(parsed.sunset)
+      || !validTime(parsed.civilDawn)
+      || !parsed.schedule
+      || typeof parsed.schedule !== "object"
+      || Array.isArray(parsed.schedule))
+    return false
+  var fields = [
+    "matinsTime", "laudsTime", "primeTime", "terceTime",
+    "sextTime", "noneTime", "vespersTime", "complineTime"
+  ]
+  for (var i = 0; i < fields.length; i++)
+    if (!validTime(parsed.schedule[fields[i]])) return false
+  return true
+}
+
+function validSolarLocation(location) {
+  return location
+    && typeof location === "object"
+    && !Array.isArray(location)
+    && boundedString(location.name, 96, false)
+    && typeof location.latitude === "number"
+    && isFinite(location.latitude)
+    && location.latitude >= -90
+    && location.latitude <= 90
+    && typeof location.longitude === "number"
+    && isFinite(location.longitude)
+    && location.longitude >= -180
+    && location.longitude <= 180
+}
+
+function parseReport(raw, kind) {
   try {
     var parsed = JSON.parse(String(raw || ""))
-    return parsed && typeof parsed === "object" ? parsed : null
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null
+    if (kind === "solar") return validSolarReport(parsed) ? parsed : null
+    return validMetadataReport(parsed) ? parsed : null
   } catch (error) {
     return null
   }
