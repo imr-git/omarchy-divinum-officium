@@ -16,6 +16,7 @@ Panel {
   property var report: null
   property var solarReport: null
   property string reportError: ""
+  property string reportRequestKey: ""
   property bool loading: false
   property bool settingsOpen: false
   property bool draftShowHourName: true
@@ -104,16 +105,37 @@ Panel {
       prefix = "Using cached metadata from " + cachedDate + ". "
     }
 
-    if (until.getTime() > root.now.getTime())
+    var accessDenied = root.report
+      && String(root.report.cooldownKind || "") === "access-denied"
+
+    if (until.getTime() > root.now.getTime()) {
+      if (accessDenied)
+        return prefix + "Divinum Officium denied the metadata request. "
+          + "Automatic retries are paused until " + Qt.formatTime(until, "HH:mm") + "."
       return prefix + "Divinum Officium requests are paused until "
         + Qt.formatTime(until, "HH:mm") + "."
+    }
+
+    if (accessDenied)
+      return prefix + "A previous metadata request was denied. Press R to retry."
 
     return prefix + "A previous Divinum Officium request was rate-limited. Press R to retry."
+  }
+
+  function currentReportRequestKey() {
+    return [
+      Model.isoDate(root.now),
+      root.version,
+      root.primaryLanguage,
+      root.secondaryLanguage
+    ].join("\u0000")
   }
 
   function open() {
     root.controller.show()
     root.refreshSolar()
+    if (root.reportRequestKey !== root.currentReportRequestKey())
+      root.refresh(false)
   }
 
   function close() {
@@ -207,6 +229,7 @@ Panel {
 
   function refresh(force) {
     if (reportProc.running) return
+    root.reportRequestKey = root.currentReportRequestKey()
     root.loading = true
     root.reportError = ""
     var command = [
@@ -248,6 +271,10 @@ Panel {
   function openSaintInfo() {
     if (!root.report || !root.report.title) return
     root.openExternal(Model.martyrologyUrl(root.now))
+  }
+
+  function openWebsite() {
+    root.openExternal("https://www.divinumofficium.com/")
   }
 
   Process {
@@ -296,7 +323,7 @@ Panel {
       var previousDate = Model.isoDate(root.now)
       root.now = new Date()
       if (previousDate !== Model.isoDate(root.now)) {
-        root.refresh()
+        if (root.opened) root.refresh(false)
         root.refreshSolar()
       }
     }
@@ -582,6 +609,28 @@ Panel {
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
             wrapMode: Text.WordWrap
+          }
+
+          Text {
+            id: websiteFallback
+            visible: root.report
+              && String(root.report.cooldownKind || "") === "access-denied"
+            width: parent.width
+            text: "Open Divinum Officium homepage  →"
+            textFormat: Text.PlainText
+            color: websiteFallbackMouse.containsMouse ? root.accent : root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            font.bold: true
+            font.underline: websiteFallbackMouse.containsMouse
+
+            MouseArea {
+              id: websiteFallbackMouse
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.openWebsite()
+            }
           }
 
           Item {

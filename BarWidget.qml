@@ -33,10 +33,7 @@ BarWidget {
   implicitHeight: button.implicitHeight
 
   onBarChanged: injectPanel()
-  onSettingsChanged: {
-    injectPanel()
-    refresh(false)
-  }
+  onSettingsChanged: injectPanel()
 
   Loader {
     id: panelLoader
@@ -45,7 +42,6 @@ BarWidget {
     visible: false
     onLoaded: {
       root.injectPanel()
-      root.refresh(false)
       Qt.callLater(root.injectPanel)
     }
   }

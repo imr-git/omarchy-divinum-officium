@@ -12,7 +12,7 @@ An unofficial [Divinum Officium](https://www.divinumofficium.com/) client for tr
 - The day's feast or Sunday, rank, liturgical season and color, and commemorations.
 - A feast-title link to the corresponding date in CatholicSaints.Info's public 1914 Roman Martyrology.
 - Fixed custom hour boundaries or a sunrise-and-sunset schedule based on the location configured in Omarchy Weather.
-- One lightweight metadata request per day, with a three-day cache, stale-data fallback, and rate-limit cooldowns.
+- One bounded metadata request when the panel first opens each day, with a three-day cache, stale-data fallback, and persistent request cooldowns.
 
 ### Settings
 
@@ -62,6 +62,7 @@ No cache cleanup is required when updating. The plugin starts a new cache schema
 - Click the cross to open or close the panel.
 - Middle-click the cross, or press `R` while the panel is focused, to refresh the liturgical metadata after any active cooldown.
 - Click an hour or **Mass of the Day** to open it on Divinum Officium.
+- If Cloudflare blocks a direct link, use the panel's homepage fallback and navigate from the site.
 - Click the feast title to open that date in the Roman Martyrology.
 - Click the gear to edit settings; press `Escape` to close settings or the panel.
 
@@ -77,13 +78,15 @@ The optional solar schedule places Matins at the eighth hour of night, Lauds at 
 
 ## Dependencies and network access
 
-The plugin requires Omarchy's Quickshell bar and Python 3; it uses only Python's standard library. Normally once per civil day for the selected rubrics and languages, its metadata helper requests the lightweight calendar heading from `www.divinumofficium.com`. A settings change or explicit manual refresh can request a new heading, but an active rate-limit cooldown is always enforced. The plugin does not prefetch complete Office or Mass pages; those are opened only when clicked.
+The plugin requires Omarchy's Quickshell bar and Python 3; it uses only Python's standard library. The first time the panel is opened each civil day for the selected rubrics and languages, its metadata helper requests the lightweight calendar heading from `www.divinumofficium.com`. Loading the shell does not make this request. A settings change or explicit manual refresh can request a new heading, but an active request cooldown is always enforced. The plugin does not prefetch complete Office or Mass pages; those are opened only when clicked.
 
-Successful metadata is retained for today and the previous three days. During an outage, the most recent matching result remains visible. An HTTP 429 response creates a persistent cooldown using the server's `Retry-After` value, or one hour when none is provided, so reopening or restarting the panel cannot repeatedly contact the service. The panel shows when an active pause ends; once it has ended, the message changes to a manual retry prompt instead of implying that the service is still rate-limiting requests.
+Successful metadata is retained for today and the previous three days. During an outage, the most recent matching result remains visible. Every response is read with a 256 KiB limit, including responses without a trustworthy `Content-Length` header. An HTTP 429 response creates a persistent cooldown using the server's `Retry-After` value, or one hour when none is provided. An HTTP 403 response creates a six-hour access-denied cooldown. This prevents panel or shell restarts from repeatedly contacting the service. The panel shows when an active pause ends; once it has ended, the message changes to a manual retry prompt.
+
+Divinum Officium is currently protected by Cloudflare after [upstream work to control bot-driven hosting costs](https://github.com/DivinumOfficium/divinum-officium/issues/5003). It may deny automated metadata requests—or even browser visits from some networks—with HTTP 403. That decision is made by the upstream site, not by this plugin's daily cache. When it happens, the plugin uses the newest matching cached metadata if one exists and offers a homepage fallback for direct links that Cloudflare blocks.
 
 Solar events are calculated locally from the coordinates already configured in Omarchy Weather. Those coordinates are not sent to Divinum Officium or another service by this plugin.
 
-Results and rate-limit state are cached under `${XDG_CACHE_HOME:-~/.cache}/omadivoff`.
+Results and request-cooldown state are cached under `${XDG_CACHE_HOME:-~/.cache}/omadivoff`.
 
 ## Remove
 

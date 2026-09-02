@@ -27,7 +27,15 @@ from urllib.request import Request, urlopen
 OFFICE_ENDPOINT = "https://www.divinumofficium.com/cgi-bin/horas/officium.pl"
 CACHE_SCHEMA_VERSION = "5"
 CACHE_RETENTION_DAYS = 3
+MAX_RESPONSE_BYTES = 256 * 1024
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 60 * 60
+DEFAULT_ACCESS_DENIED_COOLDOWN_SECONDS = 6 * 60 * 60
+REQUEST_USER_AGENT = (
+    "omarchy-divinum-officium "
+    "(+https://github.com/imr-git/omarchy-divinum-officium)"
+)
+COOLDOWN_RATE_LIMIT = "rate-limit"
+COOLDOWN_ACCESS_DENIED = "access-denied"
 HEADING_COLOR_MAP = {
     "black": "black",
     "blue": "white",
@@ -46,6 +54,14 @@ RANK_WORDS = (
     "vigilia",
     "infra octavam",
 )
+
+
+class ResponseTooLargeError(RuntimeError):
+    """Raised when an upstream response exceeds the configured safety limit."""
+
+
+class MetadataParseError(RuntimeError):
+    """Raised when an upstream response is not recognizable calendar metadata."""
 
 
 def weather_state_path() -> Path:
@@ -416,7 +432,7 @@ def find_title(lines: list[str], rank_index: int, day: date) -> str:
         if sum(token in lowered for token in date_tokens) >= 2:
             continue
         return candidate
-    return day.strftime("%A, %d %B %Y")
+    return ""
 
 
 def find_commemorations(lines: Iterable[str]) -> list[str]:
@@ -461,16 +477,37 @@ def find_heading(document: str) -> tuple[str, str, str]:
     return clean_candidate(title), clean_candidate(rank), color
 
 
+def find_visible_heading(lines: Iterable[str]) -> tuple[str, str]:
+    """Find a `Feast ~ Rank` heading when the site's HTML wrapper changes."""
+    for line in lines:
+        if "~" not in line:
+            continue
+        title, rank = (clean_candidate(part) for part in line.rsplit("~", 1))
+        lowered_rank = rank.casefold()
+        if title and rank and any(word in lowered_rank for word in RANK_WORDS):
+            return title, rank
+    return "", ""
+
+
 def parse_metadata(document: str, day: date, source_url: str) -> dict[str, object]:
     parser = VisibleTextParser()
     parser.feed(document)
     lines = parser.lines()
     title, rank, heading_color = find_heading(document)
+    visible_title, visible_rank = find_visible_heading(lines[:160])
+    if not title:
+        title = visible_title
+    if not rank:
+        rank = visible_rank
     fallback_rank, rank_index = find_rank(lines)
     if not rank:
         rank = fallback_rank
     if not title:
         title = find_title(lines, rank_index, day)
+    if not title or not rank:
+        raise MetadataParseError(
+            "Daily feast metadata response did not contain a recognizable liturgical heading."
+        )
     return {
         "date": day.isoformat(),
         "title": title,
@@ -543,12 +580,18 @@ def read_cooldown(now: datetime | None = None) -> tuple[dict[str, object], datet
     return None
 
 
-def write_cooldown(until: datetime) -> None:
+def write_cooldown(until: datetime, kind: str = COOLDOWN_RATE_LIMIT) -> None:
+    reason = (
+        "Divinum Officium access denial"
+        if kind == COOLDOWN_ACCESS_DENIED
+        else "Divinum Officium rate limit"
+    )
     write_cache(
         cooldown_path(),
         {
             "until": until.isoformat(timespec="seconds"),
-            "reason": "Divinum Officium rate limit",
+            "kind": kind,
+            "reason": reason,
         },
     )
 
@@ -581,6 +624,52 @@ def retry_after_seconds(error: HTTPError, now: datetime | None = None) -> int:
     return DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS
 
 
+def cooldown_message(kind: str, retry_time: str) -> str:
+    if kind == COOLDOWN_ACCESS_DENIED:
+        return (
+            "Divinum Officium denied the metadata request; automatic retries "
+            f"are paused until {retry_time}."
+        )
+    return f"Divinum Officium requests are paused until {retry_time}."
+
+
+def read_response_text(response: object, limit: int = MAX_RESPONSE_BYTES) -> str:
+    """Read and decode an HTTP response without allowing unbounded memory use."""
+    headers = response.headers
+    content_length = headers.get("Content-Length")
+    if content_length:
+        try:
+            if int(content_length) > limit:
+                raise ResponseTooLargeError(
+                    f"Daily feast metadata exceeded the {limit}-byte response limit."
+                )
+        except ValueError:
+            # A malformed Content-Length is untrusted metadata; the bounded
+            # reads below remain the source of truth.
+            pass
+
+    chunks: list[bytes] = []
+    remaining = limit + 1
+    while remaining > 0:
+        chunk = response.read(min(64 * 1024, remaining))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+
+    body = b"".join(chunks)
+    if len(body) > limit:
+        raise ResponseTooLargeError(
+            f"Daily feast metadata exceeded the {limit}-byte response limit."
+        )
+
+    charset = headers.get_content_charset() or "utf-8"
+    try:
+        return body.decode(charset, errors="replace")
+    except LookupError:
+        return body.decode("utf-8", errors="replace")
+
+
 def fallback_report(
     day: date,
     version: str,
@@ -589,6 +678,7 @@ def fallback_report(
     source_url: str,
     message: str,
     cooldown_until: datetime | None = None,
+    cooldown_kind: str | None = None,
 ) -> dict[str, object]:
     stale = latest_cached_report(day, version, primary, secondary)
     if stale:
@@ -612,6 +702,7 @@ def fallback_report(
         }
     if cooldown_until:
         payload["cooldownUntil"] = cooldown_until.isoformat(timespec="seconds")
+        payload["cooldownKind"] = cooldown_kind or COOLDOWN_RATE_LIMIT
     return payload
 
 
@@ -651,7 +742,10 @@ def fetch_report(
         now = current_time()
         cooldown = read_cooldown(now)
         if cooldown:
-            _, until = cooldown
+            cooldown_payload, until = cooldown
+            cooldown_kind = str(
+                cooldown_payload.get("kind") or COOLDOWN_RATE_LIMIT
+            )
             retry_time = until.astimezone().strftime("%H:%M")
             return fallback_report(
                 day,
@@ -659,29 +753,37 @@ def fetch_report(
                 primary,
                 secondary,
                 url,
-                f"Divinum Officium requests are paused until {retry_time}.",
+                cooldown_message(cooldown_kind, retry_time),
                 until,
+                cooldown_kind,
             )
 
-        # The public CGI currently rejects bot-style user agents with HTTP
-        # 403, while serving the same request to normal desktop browsers.
         request = Request(
             url,
             headers={
-                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
+                "User-Agent": REQUEST_USER_AGENT,
                 "Accept": "text/html,application/xhtml+xml",
             },
         )
         try:
             with urlopen(request, timeout=timeout) as response:
-                document = response.read().decode(
-                    response.headers.get_content_charset() or "utf-8", errors="replace"
-                )
+                document = read_response_text(response)
+            payload = parse_metadata(document, day, url)
         except HTTPError as error:
-            if error.code == 429:
-                until = now + timedelta(seconds=retry_after_seconds(error, now))
+            if error.code in {403, 429}:
+                cooldown_kind = (
+                    COOLDOWN_ACCESS_DENIED
+                    if error.code == 403
+                    else COOLDOWN_RATE_LIMIT
+                )
+                cooldown_seconds = (
+                    DEFAULT_ACCESS_DENIED_COOLDOWN_SECONDS
+                    if error.code == 403
+                    else retry_after_seconds(error, now)
+                )
+                until = now + timedelta(seconds=cooldown_seconds)
                 try:
-                    write_cooldown(until)
+                    write_cooldown(until, cooldown_kind)
                 except OSError:
                     pass
                 retry_time = until.astimezone().strftime("%H:%M")
@@ -691,8 +793,9 @@ def fetch_report(
                     primary,
                     secondary,
                     url,
-                    f"Divinum Officium requests are paused until {retry_time}.",
+                    cooldown_message(cooldown_kind, retry_time),
                     until,
+                    cooldown_kind,
                 )
             return fallback_report(
                 day,
@@ -701,6 +804,15 @@ def fetch_report(
                 secondary,
                 url,
                 f"Daily feast metadata unavailable: {error}",
+            )
+        except (ResponseTooLargeError, MetadataParseError) as error:
+            return fallback_report(
+                day,
+                version,
+                primary,
+                secondary,
+                url,
+                str(error),
             )
         except (URLError, TimeoutError, OSError) as error:
             return fallback_report(
@@ -712,7 +824,6 @@ def fetch_report(
                 f"Daily feast metadata unavailable: {error}",
             )
 
-        payload = parse_metadata(document, day, url)
         try:
             write_cache(path, payload)
             clear_cooldown()
